@@ -1,0 +1,26 @@
+s3:
+  endpoint: "https://s3.example.local:9000"
+  region: "us-east-1"
+# : S3_ACCESS_KEY / S3_SECRET_KEY.
+# , .
+  access_key: "configAccessKey"
+  secret_key: "configSecretKey"
+  use_path_style: true
+  buckets:
+  - name: "intercepted"
+    prefix: "2026/"
+dedup:
+  hash_algo: "sha256"
+  min_size_bytes: 4096 #
+  blob_prefix: "blobs/"
+  mode: "report_only" # report_only | pointer
+  delete_originals: false # :
+cache:
+  backend: "sqlite" # sqlite | leveldb
+  path: "/var/lib/s3-dedup/state.db"
+schedule:
+  scan_interval: "1h" #
+  workers: 8 #
+logging:
+  level: "info"
+  file: "/var/log/s3-dedup/service.log"
