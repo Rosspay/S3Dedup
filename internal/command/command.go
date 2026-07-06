@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"s3-dedup/internal/configParser"
+	"s3-dedup/internal/s3"
 
 	"github.com/spf13/cobra"
 )
@@ -20,7 +21,13 @@ var rootCmd = &cobra.Command{
 		if err != nil {
 			fmt.Println(err)
 		}
-		fmt.Printf("%#v\n", config)
+		//fmt.Printf("%#v\n", config)
+		s3Client, err := s3.NewClient(cmd.Context(), config)
+		if err != nil {
+			fmt.Println(err)
+		}
+		list, err := s3Client.S3Client.ListBuckets()
+		fmt.Println(list)
 	},
 }
 

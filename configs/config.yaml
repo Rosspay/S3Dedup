@@ -1,10 +1,10 @@
 s3:
-  endpoint: "https://s3.example.local:9000"
+  endpoint: "localhost:9000"
   region: "us-east-1"
 # : S3_ACCESS_KEY / S3_SECRET_KEY.
 # , .
-  access_key: "configAccessKey"
-  secret_key: "configSecretKey"
+  access_key: "admin"
+  secret_key: "password"
   use_path_style: true
   buckets:
   - name: "intercepted"
