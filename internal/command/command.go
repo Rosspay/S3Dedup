@@ -26,6 +26,17 @@ var rootCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("Health check failed: %w", err)
 		}
+		// for _, bucket := range config.S3.Buckets {
+		// 	objsInfo, err := s3Client.ListObjects(cmd.Context(), bucket.Name, bucket.Prefix, true, /* callback func I guess*/)
+		// 	if err != nil {
+		// 		return fmt.Errorf("Error reading objects info: %w", err)
+		// 	}
+		// 	fmt.Printf("Bucket: %s	Prefix: %s\n", bucket.Name, bucket.Prefix)
+		// 	for _, oInfo := range objsInfo {
+		// 		fmt.Printf("Key: %s, Size: %d, Etag: %s, Last modified: %s\n", oInfo.Key, oInfo.Size, oInfo.ETag, oInfo.LastModified)
+		// 	}
+
+		// }
 		return nil
 	},
 }
