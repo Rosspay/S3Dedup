@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"s3-dedup/internal/cache"
 	"s3-dedup/internal/configParser"
 	"s3-dedup/internal/hashing"
 	"s3-dedup/internal/s3"
@@ -33,6 +34,8 @@ var rootCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("Health check failed: %w", err)
 		}
+		store, err := cache.OpenSQLite(config.Cache.Path)
+		defer store.Close()
 		for _, bucket := range config.S3.Buckets {
 			fmt.Printf("Bucket: %s\tPrefix: %s\n", bucket.Name, bucket.Prefix)
 
@@ -46,14 +49,34 @@ var rootCmd = &cobra.Command{
 				if err != nil {
 					return err
 				}
-				fmt.Printf("Key: %s, Size: %d, Etag: %s, Last modified: %s, Hash: %s\n",
-					info.Key, info.Size, info.ETag, info.LastModified, hash)
+				// fmt.Printf("Key: %s, Size: %d, Etag: %s, Last modified: %s, Hash: %s\n",
+				// 	info.Key, info.Size, info.ETag, info.LastModified, hash)
+				record := cache.ObjectRecord{
+					Bucket:       bucket.Name,
+					Key:          info.Key,
+					ETag:         info.ETag,
+					Size:         info.Size,
+					LastModified: info.LastModified,
+					Hash:         hash,
+					LastSeenScan: "",
+				}
+				err = store.RegisterObject(ctx, record)
+				if err != nil {
+					return err
+				}
+
 				return nil
 			})
 			if err != nil {
 				return fmt.Errorf("Error listing objects in %q: %w", bucket.Name, err)
 			}
 		}
+		stats, err := store.GetStats(ctx)
+		if err != nil {
+			return fmt.Errorf("Error getting cache stats: %w", err)
+		}
+		fmt.Printf("unique_blobs: %d\nduplicates_found: %d\nbytes_reclaimable: %d\n",
+			stats.UniqueBlobs, stats.DuplicatesFound, stats.BytesReclaimable)
 		return nil
 	},
 }

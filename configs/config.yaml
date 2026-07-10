@@ -17,7 +17,7 @@ dedup:
   delete_originals: false # :
 cache:
   backend: "sqlite" # sqlite | leveldb
-  path: "/var/lib/s3-dedup/state.db"
+  path: "D:\\S3Dedup\\cmd\\s3-dedup\\state.db"
 schedule:
   scan_interval: "1h" #
   workers: 8 #
