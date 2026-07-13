@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 
 	_ "modernc.org/sqlite"
 )
@@ -16,6 +18,14 @@ type SQLiteStore struct {
 func OpenSQLite(path string) (*SQLiteStore, error) {
 	if path == "" {
 		return nil, fmt.Errorf("SQLite cache: path is empty")
+	}
+
+	//Creating a directory if needed
+	dir := filepath.Dir(path)
+	if dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, fmt.Errorf("create sqlite cache directory %q: %w", dir, err)
+		}
 	}
 
 	db, err := sql.Open("sqlite", path)
