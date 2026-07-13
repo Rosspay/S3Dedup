@@ -222,6 +222,7 @@ func decrementBlob(ctx context.Context, tx *sql.Tx, hash string) error {
 	return nil
 }
 
+// Getting required stats for report
 func (s *SQLiteStore) GetStats(ctx context.Context) (Stats, error) {
 	const query = `
 		SELECT
@@ -246,6 +247,85 @@ func (s *SQLiteStore) GetStats(ctx context.Context) (Stats, error) {
 	return stats, nil
 }
 
+// Marking object anyway
+func (s *SQLiteStore) MarkObjectSeen(ctx context.Context, bucket, key, scanID string) error {
+	const query = `
+	UPDATE objects
+	SET last_seen_scan = ?
+	WHERE bucket = ? AND object_key = ?
+	`
+	result, err := s.db.ExecContext(ctx, query, scanID, bucket, key)
+	if err != nil {
+		return fmt.Errorf("Error marking an object: %w", err)
+	}
+	row, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("Object %q/%q is not marked: %w", bucket, key, err)
+	}
+	if row != 1 {
+		return fmt.Errorf("Object %q/%q does not exist so cannot by marked", bucket, key)
+	}
+	return nil
+}
+
+// Getting rid of deleted objects from cache and updating ref_count for blobs
+func (s *SQLiteStore) FinalizeScope(ctx context.Context, bucket, prefix, scanID string) (removed int64, err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("Finilazing scope for %q/%q during scan %q: begin transaction: %w", bucket, prefix, scanID, err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx,
+		`SELECT blob_hash, COUNT(*) 
+	FROM objects 
+	WHERE bucket = ? 
+	AND substr(object_key, 1, length(?)) = ?
+	AND last_seen_scan <> ?
+	GROUP BY blob_hash`, bucket, prefix, prefix, scanID,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("FinalizeScope query failed: %w", err)
+	}
+	var blobsCount = make(map[string]int)
+	for rows.Next() {
+		var hash string
+		var cnt int
+		err := rows.Scan(&hash, &cnt)
+		if err != nil {
+			return 0, fmt.Errorf("row scan failed: %w", err)
+		}
+		blobsCount[hash] = cnt
+	}
+	for key, value := range blobsCount {
+		_, err := tx.ExecContext(ctx,
+			`UPDATE blobs
+		SET ref_count = ref_count - ?
+		WHERE hash = ?`, value, key)
+		if err != nil {
+			return 0, fmt.Errorf("Error updating ref_count for %q: %w", key, err)
+		}
+	}
+	res, err := tx.ExecContext(ctx,
+		`DELETE FROM objects
+	WHERE bucket = ?
+	AND substr(object_key, 1, length(?)) = ?
+	AND last_seen_scan <> ?`, bucket, prefix, prefix, scanID)
+	if err != nil {
+		return 0, fmt.Errorf("Error deleting old objects in cache: %w", err)
+	}
+	removed, err = res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("Error extracting rows affected: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("FinalizeScope of %q/%q for scan %q: commit transaction: %w", bucket, prefix, scanID, err)
+	}
+	return removed, nil
+}
+
+// Closing store
 func (s *SQLiteStore) Close() error {
 	if err := s.db.Close(); err != nil {
 		return fmt.Errorf("Error closing SQLite: %w", err)

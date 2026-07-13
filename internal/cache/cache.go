@@ -8,6 +8,8 @@ import (
 type Store interface {
 	RegisterObject(ctx context.Context, object ObjectRecord) error
 	GetStats(ctx context.Context) (Stats, error)
+	MarkObjectSeen(ctx context.Context, bucket, key, scanID string) error
+	FinalizeScope(ctx context.Context, bucket, prefix, scanID string) (removed int64, err error)
 	Close() error
 }
 

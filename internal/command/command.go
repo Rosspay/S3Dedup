@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
+	"time"
 
 	"s3-dedup/internal/cache"
 	"s3-dedup/internal/configParser"
@@ -21,6 +23,8 @@ var rootCmd = &cobra.Command{
 	Short: "File deduplicator for S3-storage",
 	Long:  "Service-deduplicator for object S3 storage",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		scanID := strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
+		objectsScanned := 0
 		ctx := cmd.Context()
 		config, err := configParser.Config_parser(configPath)
 		if err != nil {
@@ -40,7 +44,9 @@ var rootCmd = &cobra.Command{
 			fmt.Printf("Bucket: %s\tPrefix: %s\n", bucket.Name, bucket.Prefix)
 
 			// Getting objects in stream
-			err := s3Client.ListObjects(ctx, bucket.Name, bucket.Prefix, true, func(info minio.ObjectInfo) error {
+			err := s3Client.ListObjects(ctx, bucket.Name, bucket.Prefix, false, func(info minio.ObjectInfo) error {
+				// Marking an object anyway even if error will occur
+				store.MarkObjectSeen(ctx, bucket.Name, info.Key, scanID)
 				// Filtering objects that are below min size from config
 				if info.Size < int64(config.Dedup.Min_size_bytes) {
 					return nil
@@ -49,8 +55,8 @@ var rootCmd = &cobra.Command{
 				if err != nil {
 					return err
 				}
-				// fmt.Printf("Key: %s, Size: %d, Etag: %s, Last modified: %s, Hash: %s\n",
-				// 	info.Key, info.Size, info.ETag, info.LastModified, hash)
+				fmt.Printf("Key: %s, Size: %d, Etag: %s, Last modified: %s, Hash: %s\n",
+					info.Key, info.Size, info.ETag, info.LastModified, hash)
 				record := cache.ObjectRecord{
 					Bucket:       bucket.Name,
 					Key:          info.Key,
@@ -58,18 +64,24 @@ var rootCmd = &cobra.Command{
 					Size:         info.Size,
 					LastModified: info.LastModified,
 					Hash:         hash,
-					LastSeenScan: "",
+					LastSeenScan: scanID,
 				}
 				err = store.RegisterObject(ctx, record)
 				if err != nil {
 					return err
 				}
-
+				//Counting objects scanned for report
+				objectsScanned++
 				return nil
 			})
 			if err != nil {
 				return fmt.Errorf("Error listing objects in %q: %w", bucket.Name, err)
 			}
+			removed, err := store.FinalizeScope(ctx, bucket.Name, bucket.Prefix, scanID)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Number of objects removed: %d\n", removed)
 		}
 		stats, err := store.GetStats(ctx)
 		if err != nil {
