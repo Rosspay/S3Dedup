@@ -26,3 +26,7 @@ go.work.sum
 .vscode/launch.json
 internal/cache/cover.txt
 cmd/s3-dedup/state.db
+internal/hashing/cover.txt
+cmd/s3-dedup/state.db
+cmd/s3-dedup/state.db
+cmd/s3-dedup/report.json

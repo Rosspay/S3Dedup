@@ -60,13 +60,13 @@ func (c *Client) HealthCheck(ctx context.Context, config *configParser.Config) e
 func (c *Client) ListObjects(ctx context.Context, bucket string, prefix string, recursive bool, fn func(minio.ObjectInfo) error) error {
 	for object := range c.S3Client.ListObjectsV2(bucket, prefix, recursive, ctx.Done()) {
 		if object.Err != nil {
-			// TODO logger, error counting
+			// TODO logger
 			return fmt.Errorf("List objects %q: %w", bucket, object.Err)
 		}
 		err := fn(object)
 		if err != nil {
-			// TODO logger, error counting
-			fmt.Printf("Error reading object: %v\n", err)
+			// TODO logger
+			return fmt.Errorf("Error reading object: %w\n", err)
 		}
 	}
 	return nil

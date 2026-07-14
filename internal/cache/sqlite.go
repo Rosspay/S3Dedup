@@ -180,6 +180,7 @@ func incrementBlob(ctx context.Context, tx *sql.Tx, hash string, size int64) err
 	err := tx.QueryRowContext(ctx, `SELECT size FROM blobs WHERE hash = ?`, hash).Scan(&storedSize)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
+		//Insert new blob
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO blobs (hash, size, ref_count) VALUES (?, ?, 1)`,
 			hash,
@@ -193,7 +194,7 @@ func incrementBlob(ctx context.Context, tx *sql.Tx, hash string, size int64) err
 	case storedSize != size:
 		return fmt.Errorf("blob %q size mismatch: stored %d, object %d", hash, storedSize, size)
 	}
-
+	// Update ref_count for blobs, that already was in cache
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE blobs SET ref_count = ref_count + 1 WHERE hash = ?`,
 		hash,
@@ -276,6 +277,7 @@ func (s *SQLiteStore) FinalizeScope(ctx context.Context, bucket, prefix, scanID 
 	}
 	defer tx.Rollback()
 
+	// Hash and number of objects that hasn't been discovered during this scan
 	rows, err := tx.QueryContext(ctx,
 		`SELECT blob_hash, COUNT(*) 
 	FROM objects 
@@ -297,6 +299,7 @@ func (s *SQLiteStore) FinalizeScope(ctx context.Context, bucket, prefix, scanID 
 		}
 		blobsCount[hash] = cnt
 	}
+	// Updating ref_count for blobs
 	for key, value := range blobsCount {
 		_, err := tx.ExecContext(ctx,
 			`UPDATE blobs
@@ -306,6 +309,7 @@ func (s *SQLiteStore) FinalizeScope(ctx context.Context, bucket, prefix, scanID 
 			return 0, fmt.Errorf("Error updating ref_count for %q: %w", key, err)
 		}
 	}
+	//Deleting old objects, that hasn't been discovered during this scan
 	res, err := tx.ExecContext(ctx,
 		`DELETE FROM objects
 	WHERE bucket = ?

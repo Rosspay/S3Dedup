@@ -94,7 +94,6 @@ func TestOpenSQLiteErrors(t *testing.T) {
 	if err == nil {
 		t.Fatal("Must be error path is empty")
 	}
-	//TODO other errors
 }
 
 func TestFinalizeScopeObjectIsNotDiscoveredSameHash(t *testing.T) {
