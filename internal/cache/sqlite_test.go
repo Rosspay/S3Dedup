@@ -97,6 +97,109 @@ func TestOpenSQLiteErrors(t *testing.T) {
 	//TODO other errors
 }
 
+func TestFinalizeScopeObjectIsNotDiscoveredSameHash(t *testing.T) {
+	store := openTestStore(t)
+	register(t, store, record("bucket", "one.txt", "hash", 100))
+	register(t, store, record("bucket", "two.txt", "hash", 100))
+	err := store.MarkObjectSeen(context.Background(), "bucket", "one.txt", "scan-2")
+	if err != nil {
+		t.Fatalf("Error marking an object: %v", err)
+	}
+	removed, err := store.FinalizeScope(context.Background(), "bucket", "", "scan-2")
+	if err != nil {
+		t.Fatalf("Error finalizing scope: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("Object was not removed during scope finalize")
+	}
+	assertRefCount(t, store, "hash", 1)
+	assertStats(t, store, Stats{
+		UniqueBlobs:      1,
+		DuplicatesFound:  0,
+		BytesReclaimable: 0,
+	})
+}
+
+func TestFinalizeScopeObjectIsNotDiscoveredDiffHash(t *testing.T) {
+	store := openTestStore(t)
+	register(t, store, record("bucket", "one.txt", "hash", 100))
+	register(t, store, record("bucket", "two.txt", "diffHash", 100))
+	err := store.MarkObjectSeen(context.Background(), "bucket", "one.txt", "scan-2")
+	if err != nil {
+		t.Fatalf("Error marking an object: %v", err)
+	}
+	removed, err := store.FinalizeScope(context.Background(), "bucket", "", "scan-2")
+	if err != nil {
+		t.Fatalf("Error finalizing scope: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("Object was not removed during scope finalize")
+	}
+	assertRefCount(t, store, "hash", 1)
+	assertRefCount(t, store, "diffHash", 0)
+	assertStats(t, store, Stats{
+		UniqueBlobs:      1,
+		DuplicatesFound:  0,
+		BytesReclaimable: 0,
+	})
+}
+
+func TestFinalizeScopeIsIdempotent(t *testing.T) {
+	store := openTestStore(t)
+	register(t, store, record("bucket", "one.txt", "hash", 100))
+	register(t, store, record("bucket", "two.txt", "hash", 100))
+	removed, err := store.FinalizeScope(context.Background(), "bucket", "", "scan-1")
+	if err != nil {
+		t.Fatalf("Error finalizing scope: %v", err)
+	}
+	if removed != 0 {
+		t.Fatalf("Object shouldn't be removed")
+	}
+	assertRefCount(t, store, "hash", 2)
+	assertStats(t, store, Stats{
+		UniqueBlobs:      1,
+		DuplicatesFound:  1,
+		BytesReclaimable: 100,
+	})
+	removed, err = store.FinalizeScope(context.Background(), "bucket", "", "scan-1")
+	if err != nil {
+		t.Fatalf("Error finalizing scope: %v", err)
+	}
+	if removed != 0 {
+		t.Fatalf("Object shouldn't be removed")
+	}
+	assertRefCount(t, store, "hash", 2)
+	assertStats(t, store, Stats{
+		UniqueBlobs:      1,
+		DuplicatesFound:  1,
+		BytesReclaimable: 100,
+	})
+}
+
+func TestFinalizeScopeDoesNotAffectDiffPrefix(t *testing.T) {
+	store := openTestStore(t)
+	register(t, store, record("bucket", "2026/one.txt", "hash", 100))
+	register(t, store, record("bucket", "2025/one.txt", "hash", 100))
+	err := store.MarkObjectSeen(context.Background(), "bucket", "2026/one.txt", "scan-2")
+	if err != nil {
+		t.Fatalf("Error marking an object: %v", err)
+	}
+	removed, err := store.FinalizeScope(context.Background(), "bucket", "2025/", "scan-2")
+	if err != nil {
+		t.Fatalf("Error finalizing scope: %v", err)
+	}
+	if removed == 2 {
+		t.Fatalf("Finalize scope affected different prefix")
+	}
+	assertRefCount(t, store, "hash", 1)
+	assertStats(t, store, Stats{
+		UniqueBlobs:      1,
+		DuplicatesFound:  0,
+		BytesReclaimable: 0,
+	})
+
+}
+
 func openTestStore(t *testing.T) *SQLiteStore {
 	t.Helper()
 	store, err := OpenSQLite(filepath.Join(t.TempDir(), "test.db"))
