@@ -1,4 +1,4 @@
-package configParser
+package config
 
 import (
 	"bytes"
@@ -17,20 +17,20 @@ type Bucket struct {
 }
 
 type S3 struct {
-	Endpoint       string   `yaml:"endpoint"`
-	Region         string   `yaml:"region"`
-	Access_key     string   `yaml:"access_key" envconfig:"S3_ACCESS_KEY"`
-	Secret_key     string   `yaml:"secret_key" envconfig:"S3_SECRET_KEY"`
-	Use_path_style bool     `yaml:"use_path_style"`
-	Buckets        []Bucket `yaml:"buckets"`
+	Endpoint     string   `yaml:"endpoint"`
+	Region       string   `yaml:"region"`
+	AccessKey    string   `yaml:"access_key" envconfig:"S3_ACCESS_KEY"`
+	SecretKey    string   `yaml:"secret_key" envconfig:"S3_SECRET_KEY"`
+	UsePathStyle bool     `yaml:"use_path_style"`
+	Buckets      []Bucket `yaml:"buckets"`
 }
 
 type Dedup struct {
-	Hash_algo        string `yaml:"hash_algo"`
-	Min_size_bytes   int    `yaml:"min_size_bytes"`
-	Blob_prefix      string `yaml:"blob_prefix"`
-	Mode             string `yaml:"mode"`
-	Delete_originals bool   `yaml:"delete_originals"`
+	HashAlgo        string `yaml:"hash_algo"`
+	MinSizeBytes    int64  `yaml:"min_size_bytes"`
+	BlobPrefix      string `yaml:"blob_prefix"`
+	Mode            string `yaml:"mode"`
+	DeleteOriginals bool   `yaml:"delete_originals"`
 }
 
 type Cache struct {
@@ -39,8 +39,8 @@ type Cache struct {
 }
 
 type Schedule struct {
-	Scan_interval string `yaml:"scan_interval"`
-	Workers       int    `yaml:"workers"`
+	ScanInterval string `yaml:"scan_interval"`
+	Workers      int64  `yaml:"workers"`
 }
 
 type Logging struct {
@@ -60,7 +60,7 @@ type Config struct {
 // Config parser with env var priority
 // input: a path to a yaml config file in string format
 // output: pointer to a struct config and possible errors
-func Config_parser(filePath string) (*Config, error) {
+func ConfigParser(filePath string) (*Config, error) {
 	filename, _ := filepath.Abs(filePath)
 	yamlFile, err := os.ReadFile(filename)
 

@@ -1,4 +1,4 @@
-package configParser
+package config
 
 import (
 	"testing"
@@ -10,11 +10,11 @@ import (
 func TestBasicConfigParser(t *testing.T) {
 	expectedConfig := Config{
 		S3: S3{
-			Endpoint:       "https://s3.example.local:9000",
-			Region:         "us-east-1",
-			Access_key:     "configAccessKey",
-			Secret_key:     "configSecretKey",
-			Use_path_style: true,
+			Endpoint:     "https://s3.example.local:9000",
+			Region:       "us-east-1",
+			AccessKey:    "configAccessKey",
+			SecretKey:    "configSecretKey",
+			UsePathStyle: true,
 			Buckets: []Bucket{
 				{
 					Name:   "intercepted",
@@ -23,26 +23,26 @@ func TestBasicConfigParser(t *testing.T) {
 			},
 		},
 		Dedup: Dedup{
-			Hash_algo:        "sha256",
-			Min_size_bytes:   4096,
-			Blob_prefix:      "blobs/",
-			Mode:             "report_only",
-			Delete_originals: false,
+			HashAlgo:        "sha256",
+			MinSizeBytes:    4096,
+			BlobPrefix:      "blobs/",
+			Mode:            "report_only",
+			DeleteOriginals: false,
 		},
 		Cache: Cache{
 			Backend: "sqlite",
 			Path:    "/var/lib/s3-dedup/state.db",
 		},
 		Schedule: Schedule{
-			Scan_interval: "1h",
-			Workers:       8,
+			ScanInterval: "1h",
+			Workers:      8,
 		},
 		Logging: Logging{
 			Level: "info",
 			File:  "/var/log/s3-dedup/service.log",
 		},
 	}
-	resultConfig, err := Config_parser("./test_config.yaml")
+	resultConfig, err := ConfigParser("./test_config.yaml")
 	isEqual := cmp.Equal(&expectedConfig, resultConfig)
 	if !isEqual || err != nil {
 		t.Error(`Config_parser basic test failed`)
@@ -55,9 +55,9 @@ func TestEnvVarReading(t *testing.T) {
 	s3secret := "ThisMustBeSecret"
 	t.Setenv("S3_ACCESS_KEY", s3key)
 	t.Setenv("S3_SECRET_KEY", s3secret)
-	resultConfig, err := Config_parser("./test_config.yaml")
-	isEqualKey := s3key == resultConfig.S3.Access_key
-	isEqualSecret := s3secret == resultConfig.S3.Secret_key
+	resultConfig, err := ConfigParser("./test_config.yaml")
+	isEqualKey := s3key == resultConfig.S3.AccessKey
+	isEqualSecret := s3secret == resultConfig.S3.SecretKey
 	if !isEqualKey || !isEqualSecret || err != nil {
 		t.Error("Reading env var failed")
 	}
@@ -65,7 +65,7 @@ func TestEnvVarReading(t *testing.T) {
 
 // Testing error handling for passing wrong path
 func TestErrorNoSuchFile(t *testing.T) {
-	resultConfig, err := Config_parser("./no_such_file.yaml")
+	resultConfig, err := ConfigParser("./no_such_file.yaml")
 	if resultConfig != nil || err.Error() != "Config path error: No such file" {
 		t.Error("Error handling with passing wrong file failed")
 	}
@@ -73,7 +73,7 @@ func TestErrorNoSuchFile(t *testing.T) {
 
 // Testing error handling for passing wrong config structure
 func TestWrongFileStructure(t *testing.T) {
-	resultConfig, err := Config_parser("./wrong_structure.yaml")
+	resultConfig, err := ConfigParser("./wrong_structure.yaml")
 	if resultConfig != nil || err.Error() != "Parsing config file error: Wrong config structure" {
 		t.Error("Error handling with passing a config with a wrong structure failed")
 	}

@@ -3,7 +3,8 @@ package s3
 import (
 	"context"
 	"fmt"
-	"s3-dedup/internal/configParser"
+	"io"
+	"s3-dedup/internal/config"
 
 	"github.com/minio/minio-go/v6"
 	"github.com/minio/minio-go/v6/pkg/credentials"
@@ -17,11 +18,11 @@ type Client struct {
 // Client constructor
 // Receives context, config
 // Returns pointer to a client and possible errors
-func NewClient(ctx context.Context, config *configParser.Config) (*Client, error) {
+func NewClient(ctx context.Context, config *config.Config) (*Client, error) {
 	client, err := minio.NewWithOptions(config.S3.Endpoint, &minio.Options{
 		Creds: credentials.NewStaticV4(
-			config.S3.Access_key,
-			config.S3.Secret_key,
+			config.S3.AccessKey,
+			config.S3.SecretKey,
 			"",
 		),
 		Secure: false,
@@ -39,7 +40,7 @@ func NewClient(ctx context.Context, config *configParser.Config) (*Client, error
 // 2. Verifies that every bucket listed in config exists and is accesible
 // Receives context and config
 // Returns an error on the first bucket that fails
-func (c *Client) HealthCheck(ctx context.Context, config *configParser.Config) error {
+func (c *Client) HealthCheck(ctx context.Context, config *config.Config) error {
 	if len(config.S3.Buckets) == 0 {
 		return fmt.Errorf("healthcheck: no buckets configured")
 	}
@@ -70,4 +71,12 @@ func (c *Client) ListObjects(ctx context.Context, bucket string, prefix string, 
 		}
 	}
 	return nil
+}
+
+func (c *Client) GetObject(ctx context.Context, bucket string, key string) (io.ReadCloser, error) {
+	obj, err := c.S3Client.GetObjectWithContext(ctx, bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("Get object %q: %w", key, err)
+	}
+	return obj, nil
 }
