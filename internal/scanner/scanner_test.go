@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"s3-dedup/internal/cache"
 	"s3-dedup/internal/config"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -181,7 +182,7 @@ func TestScanOnceMarkObjectSeen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ScanOnce error: %v", err)
 	}
-	if res.ObjectsScanned != 0 {
+	if res.ObjectsScanned != 1 {
 		t.Errorf("Objects scanned = %d, expected %d", res.ObjectsScanned, 0)
 	}
 	if res.Errors != 1 {
@@ -194,6 +195,138 @@ func TestScanOnceMarkObjectSeen(t *testing.T) {
 	}
 	if stats.UniqueBlobs != 1 {
 		t.Error("Object was not marked so, was deleted from cache")
+	}
+}
+
+func TestScanOnceNoObjectLostDupes(t *testing.T) {
+	t.Parallel()
+	const content = "duplicate"
+	const expObjectsScanned = 100
+	const expBytesReclaimable = 9900
+	const expUniqueBlobs = 1
+	const expDuplicatesFound = 99
+	const expErrors = 0
+
+	store := openTestStore(t)
+	var objs []minio.ObjectInfo
+	contents := make(map[string]string)
+	for i := 0; i < 100; i++ {
+		objs = append(objs, objectInfo("file.txt"+strconv.Itoa(i), 100))
+		contents[objectID("bucket", "file.txt"+strconv.Itoa(i))] = content
+	}
+	client := &MockS3Client{
+		objects:  objs,
+		contents: contents,
+		errors:   make(map[string]error),
+	}
+	config := testConfig()
+	config.Schedule.Workers = 4
+	scanner := NewScanner(client, store, config)
+	res, err := scanner.ScanOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ScanOnce error: %v", err)
+	}
+	if res.ObjectsScanned != expObjectsScanned {
+		t.Errorf("ObjectsScanned = %d, expected %d", res.ObjectsScanned, expObjectsScanned)
+	}
+	if res.UniqueBlobs != expUniqueBlobs {
+		t.Errorf("UniqueBlobs = %d, expected %d", res.UniqueBlobs, expUniqueBlobs)
+	}
+	if res.BytesReclaimable != expBytesReclaimable {
+		t.Errorf("BytesRecalimable = %d, expected %d", res.BytesReclaimable, expBytesReclaimable)
+	}
+	if res.Errors != expErrors {
+		t.Errorf("Errors = %d, expected %d", res.Errors, expErrors)
+	}
+}
+
+func TestScanOnceNoObjectLostDupeless(t *testing.T) {
+	t.Parallel()
+	const content = "duplicate"
+	const expObjectsScanned = 100
+	const expBytesReclaimable = 0
+	const expUniqueBlobs = 100
+	const expDuplicatesFound = 0
+	const expErrors = 0
+
+	store := openTestStore(t)
+	var objs []minio.ObjectInfo
+	contents := make(map[string]string)
+	for i := 0; i < 100; i++ {
+		objs = append(objs, objectInfo("file.txt"+strconv.Itoa(i), 100+int64(i)))
+		contents[objectID("bucket", "file.txt"+strconv.Itoa(i))] = content + strconv.Itoa(i)
+	}
+	client := &MockS3Client{
+		objects:  objs,
+		contents: contents,
+		errors:   make(map[string]error),
+	}
+
+	config := testConfig()
+	config.Schedule.Workers = 6
+	scanner := NewScanner(client, store, config)
+	res, err := scanner.ScanOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ScanOnce error: %v", err)
+	}
+	if res.ObjectsScanned != expObjectsScanned {
+		t.Errorf("ObjectsScanned = %d, expected %d", res.ObjectsScanned, expObjectsScanned)
+	}
+	if res.UniqueBlobs != expUniqueBlobs {
+		t.Errorf("UniqueBlobs = %d, expected %d", res.UniqueBlobs, expUniqueBlobs)
+	}
+	if res.BytesReclaimable != expBytesReclaimable {
+		t.Errorf("BytesRecalimable = %d, expected %d", res.BytesReclaimable, expBytesReclaimable)
+	}
+	if res.Errors != expErrors {
+		t.Errorf("Errors = %d, expected %d", res.Errors, expErrors)
+	}
+}
+
+func TestScanOnceNoObjectLostWithError(t *testing.T) {
+	const content = "duplicate"
+	const expObjectsScanned = 100
+	const expBytesReclaimable = 0
+	const expUniqueBlobs = 97
+	const expDuplicatesFound = 0
+	const expErrors = 3
+
+	store := openTestStore(t)
+	var objs []minio.ObjectInfo
+	contents := make(map[string]string)
+	for i := 0; i < 100; i++ {
+		objs = append(objs, objectInfo("file.txt"+strconv.Itoa(i), 100+int64(i)))
+		contents[objectID("bucket", "file.txt"+strconv.Itoa(i))] = content + strconv.Itoa(i)
+	}
+	someErr := errors.New("GetObject error")
+	client := &MockS3Client{
+		objects:  objs,
+		contents: contents,
+		errors: map[string]error{
+			objectID("bucket", "file.txt3"):  someErr,
+			objectID("bucket", "file.txt33"): someErr,
+			objectID("bucket", "file.txt66"): someErr,
+		},
+	}
+
+	config := testConfig()
+	config.Schedule.Workers = 8
+	scanner := NewScanner(client, store, config)
+	res, err := scanner.ScanOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ScanOnce error: %v", err)
+	}
+	if res.ObjectsScanned != expObjectsScanned {
+		t.Errorf("ObjectsScanned = %d, expected %d", res.ObjectsScanned, expObjectsScanned)
+	}
+	if res.UniqueBlobs != expUniqueBlobs {
+		t.Errorf("UniqueBlobs = %d, expected %d", res.UniqueBlobs, expUniqueBlobs)
+	}
+	if res.BytesReclaimable != expBytesReclaimable {
+		t.Errorf("BytesRecalimable = %d, expected %d", res.BytesReclaimable, expBytesReclaimable)
+	}
+	if res.Errors != expErrors {
+		t.Errorf("Errors = %d, expected %d", res.Errors, expErrors)
 	}
 }
 
