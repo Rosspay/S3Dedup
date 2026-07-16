@@ -33,6 +33,9 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 		return nil, fmt.Errorf("Open SQLite cach %q: %w", path, err)
 	}
 
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
 	store := &SQLiteStore{
 		db: db,
 	}
