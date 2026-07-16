@@ -3,6 +3,7 @@ package command
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"s3-dedup/internal/cache"
 	"s3-dedup/internal/config"
@@ -57,8 +58,11 @@ var scanOnce = &cobra.Command{
 		)
 
 		scanReport, err := scanner.ScanOnce(ctx)
-
+		if err != nil {
+			return err
+		}
 		if reportPath != "" {
+			scanReport.ScanFinished = time.Now().UTC()
 			err := report.WriteJSON(reportPath, scanReport)
 			if err != nil {
 				return err

@@ -259,12 +259,9 @@ func (s *SQLiteStore) MarkObjectSeen(ctx context.Context, bucket, key, scanID st
 	if err != nil {
 		return fmt.Errorf("Error marking an object: %w", err)
 	}
-	row, err := result.RowsAffected()
+	_, err = result.RowsAffected()
 	if err != nil {
 		return fmt.Errorf("Object %q/%q is not marked: %w", bucket, key, err)
-	}
-	if row != 1 {
-		return fmt.Errorf("Object %q/%q does not exist so cannot by marked", bucket, key)
 	}
 	return nil
 }

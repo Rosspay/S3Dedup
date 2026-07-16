@@ -50,7 +50,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) (report.Report, error) {
 	var scanReport report.Report
 	scanReport.ScanStarted = time.Now().UTC()
 	scanReport.Mode = s.config.Dedup.Mode
-	scanID := strconv.FormatInt(scanReport.ScanStarted.Unix(), 10)
+	scanID := strconv.FormatInt(scanReport.ScanStarted.UnixNano(), 10)
 
 	for _, bucket := range s.config.S3.Buckets {
 		err := s.s3Client.ListObjects(ctx, bucket.Name, bucket.Prefix, true,
@@ -58,7 +58,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) (report.Report, error) {
 				processError := s.processObject(ctx, bucket.Name, info, scanID)
 				if processError != nil {
 					scanReport.Errors++
-					fmt.Printf("Processing object %s/%s: %v", bucket.Name, info.Key, processError)
+					fmt.Printf("Processing object %s/%s: %v\n", bucket.Name, info.Key, processError)
 					return nil
 				}
 				scanReport.ObjectsScanned++
@@ -66,7 +66,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) (report.Report, error) {
 			})
 		if err != nil {
 			scanReport.Errors++
-			return scanReport, fmt.Errorf("Error listing objects in %q: %w", bucket.Name, err)
+			return scanReport, err
 		}
 		_, err = s.store.FinalizeScope(ctx, bucket.Name, bucket.Prefix, scanID)
 		if err != nil {
@@ -83,7 +83,6 @@ func (s *Scanner) ScanOnce(ctx context.Context) (report.Report, error) {
 	scanReport.UniqueBlobs = stats.UniqueBlobs
 	scanReport.DuplicatesFound = stats.DuplicatesFound
 	scanReport.BytesReclaimable = stats.BytesReclaimable
-	scanReport.ScanFinished = time.Now().UTC()
 
 	return scanReport, nil
 }
