@@ -19,7 +19,7 @@ cache:
   backend: "sqlite" # sqlite | leveldb
   path: "D:\\S3Dedup\\cmd\\s3-dedup\\state.db"
 schedule:
-  scan_interval: "1h" #
+  scan_interval: "20s" #
   workers: 8 #
 logging:
   level: "info"
