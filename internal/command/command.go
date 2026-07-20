@@ -72,6 +72,9 @@ var runInterval = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("Parse scan interval: %w", err)
 		}
+		if interval <= 0 {
+			return fmt.Errorf("Scan interval must be > 0")
+		}
 
 		return runLoop(ctx, interval, application.Scanner.ScanOnce, reportPath)
 	},
@@ -82,9 +85,9 @@ func run(ctx context.Context, scan ScanFunc, out string) error {
 
 	var writeErr error
 	if out != "" {
-		scanReport.ScanFinished = time.Now().UTC()
+		//scanReport.ScanFinished = time.Now().UTC()
 		fmt.Printf("%+v\n", scanReport)
-		writeErr = report.WriteJSON(reportPath, scanReport)
+		writeErr = report.WriteJSON(out, scanReport)
 	}
 	return errors.Join(scanErr, writeErr)
 }
@@ -99,7 +102,7 @@ func runLoop(ctx context.Context, interval time.Duration, scan ScanFunc, out str
 			}
 			fmt.Printf("scan failed: %v\n", err)
 		}
-
+		i++
 		timer := time.NewTimer(interval)
 		select {
 		case <-timer.C:

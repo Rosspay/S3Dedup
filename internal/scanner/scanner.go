@@ -55,21 +55,27 @@ func NewScanner(s3Client S3Client, store cache.Store, config *config.Config) *Sc
 	}
 }
 
-func (s *Scanner) ScanOnce(ctx context.Context) (report.Report, error) {
-	var scanReport report.Report
+func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resErr error) {
 	scanReport.ScanStarted = time.Now().UTC()
+
 	scanReport.Mode = s.config.Dedup.Mode
 	scanID := strconv.FormatInt(scanReport.ScanStarted.UnixNano(), 10)
 	workers := s.config.Schedule.Workers
 	if workers <= 0 {
 		workers = 1
 	}
-	if workers > int64(runtime.NumCPU()) {
-		workers = int64(runtime.NumCPU())
+	if workers > int64(runtime.NumCPU()*2) {
+		workers = int64(runtime.NumCPU() * 2)
 	}
 
 	var objectsScanned atomic.Int64
 	var processErrors atomic.Int64
+
+	defer func() {
+		scanReport.ScanFinished = time.Now().UTC()
+		scanReport.ObjectsScanned = objectsScanned.Load()
+		scanReport.Errors += processErrors.Load()
+	}()
 
 	for _, bucket := range s.config.S3.Buckets {
 		jobs := make(chan objectJob, workers)
@@ -90,16 +96,23 @@ func (s *Scanner) ScanOnce(ctx context.Context) (report.Report, error) {
 		}
 		err := s.s3Client.ListObjects(ctx, bucket.Name, bucket.Prefix, true,
 			func(info minio.ObjectInfo) error {
-				objectsScanned.Add(1)
+
 				err := s.store.MarkObjectSeen(ctx, bucket.Name, info.Key, scanID)
 				if err != nil {
 					processErrors.Add(1)
 					return fmt.Errorf("MarkObjectSeen error for %q: %w\n", info.Key, err)
 				}
 				if info.Size < s.config.Dedup.MinSizeBytes {
+					return s.store.UnregisterObject(ctx, bucket.Name, info.Key)
+				}
+				objectsScanned.Add(1)
+				isUnchanged, err := s.store.IsObjectUnchanged(ctx, bucket.Name, info.Key, info.ETag, info.Size, info.LastModified)
+				if err != nil {
+					return fmt.Errorf("check cached object %q: %w", info.Key, err)
+				}
+				if isUnchanged {
 					return nil
 				}
-
 				select {
 				case jobs <- objectJob{
 					buket:  bucket.Name,
@@ -111,12 +124,14 @@ func (s *Scanner) ScanOnce(ctx context.Context) (report.Report, error) {
 					return ctx.Err()
 				}
 			})
+
+		close(jobs)
+		wg.Wait()
+
 		if err != nil {
 			scanReport.Errors++
 			return scanReport, err
 		}
-		close(jobs)
-		wg.Wait()
 
 		_, err = s.store.FinalizeScope(ctx, bucket.Name, bucket.Prefix, scanID)
 		if err != nil {
@@ -129,8 +144,6 @@ func (s *Scanner) ScanOnce(ctx context.Context) (report.Report, error) {
 		scanReport.Errors++
 		return scanReport, fmt.Errorf("GetStats error: %w", err)
 	}
-	scanReport.ObjectsScanned += objectsScanned.Load()
-	scanReport.Errors += processErrors.Load()
 	scanReport.UniqueBlobs = stats.UniqueBlobs
 	scanReport.DuplicatesFound = stats.DuplicatesFound
 	scanReport.BytesReclaimable = stats.BytesReclaimable

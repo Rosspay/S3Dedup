@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -161,6 +162,75 @@ func (s *SQLiteStore) RegisterObject(ctx context.Context, object ObjectRecord) e
 		return fmt.Errorf("register object %q/%q: commit transaction: %w", object.Bucket, object.Key, err)
 	}
 	return nil
+}
+
+func (s *SQLiteStore) UnregisterObject(
+	ctx context.Context,
+	bucket string,
+	key string,
+) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("unregister object %q/%q: begin transaction: %w", bucket, key, err)
+	}
+	defer tx.Rollback()
+
+	var hash string
+	err = tx.QueryRowContext(ctx, `
+        SELECT blob_hash
+        FROM objects
+        WHERE bucket = ? AND object_key = ?
+    `, bucket, key).Scan(&hash)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil
+	case err != nil:
+		return fmt.Errorf("unregister object %q/%q: read object: %w", bucket, key, err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+        DELETE FROM objects
+        WHERE bucket = ? AND object_key = ?
+    `, bucket, key); err != nil {
+		return fmt.Errorf("unregister object %q/%q: delete object: %w", bucket, key, err)
+	}
+
+	if err := decrementBlob(ctx, tx, hash); err != nil {
+		return fmt.Errorf("unregister object %q/%q: %w", bucket, key, err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("unregister object %q/%q: commit: %w", bucket, key, err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) IsObjectUnchanged(
+	ctx context.Context,
+	bucket string,
+	key string,
+	etag string,
+	size int64,
+	lastModified time.Time,
+) (bool, error) {
+	const query = `
+	SELECT 1 FROM objects
+	WHERE bucket = ?
+	AND object_key = ? 
+	AND etag = ?
+	AND size = ?
+	AND last_modified = ?
+	`
+
+	var found int
+	err := s.db.QueryRowContext(ctx, query, bucket, size, etag, size, lastModified).Scan(&found)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("check object %q/%q: %w", bucket, key, err)
+	}
+	return true, nil
 }
 
 func validateObject(object ObjectRecord) error {

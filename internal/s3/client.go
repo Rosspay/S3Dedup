@@ -25,8 +25,9 @@ func NewClient(ctx context.Context, config *config.Config) (*Client, error) {
 			config.S3.SecretKey,
 			"",
 		),
-		Secure: false,
-		Region: config.S3.Region,
+		Secure:       false,
+		Region:       config.S3.Region,
+		BucketLookup: ternary(config.S3.UsePathStyle, minio.BucketLookupPath, minio.BucketLookupAuto),
 	})
 
 	if err != nil {
@@ -79,4 +80,11 @@ func (c *Client) GetObject(ctx context.Context, bucket string, key string) (io.R
 		return nil, fmt.Errorf("Get object %q: %w", key, err)
 	}
 	return obj, nil
+}
+
+func ternary[T any](cond bool, trueVal, falseVal T) T {
+	if cond {
+		return trueVal
+	}
+	return falseVal
 }

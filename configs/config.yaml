@@ -11,7 +11,7 @@ s3:
     prefix: "my-prefix/"
 dedup:
   hash_algo: "sha256"
-  min_size_bytes: 4096 #
+  min_size_bytes: 200000 #
   blob_prefix: "blobs/"
   mode: "report_only" # report_only | pointer
   delete_originals: false # :
