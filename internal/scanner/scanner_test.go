@@ -76,6 +76,20 @@ func (m *MockS3Client) GetObject(
 	return io.NopCloser(strings.NewReader(content)), nil
 }
 
+func (m *MockS3Client) PutObject(
+	ctx context.Context,
+	bucket string,
+	objectName string,
+	reader io.Reader,
+	size int64,
+) (int64, error) {
+	return 0, nil
+}
+
+func (m *MockS3Client) StatObject(ctx context.Context, bucket string, objectName string) (minio.ObjectInfo, error) {
+	return minio.ObjectInfo{}, nil
+}
+
 func TestScanOnceFindDuplicateContent(t *testing.T) {
 	const content = "duplicate"
 	const expObjectsScanned = 2

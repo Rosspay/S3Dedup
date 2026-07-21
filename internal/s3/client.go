@@ -82,6 +82,28 @@ func (c *Client) GetObject(ctx context.Context, bucket string, key string) (io.R
 	return obj, nil
 }
 
+func (c *Client) StatObject(ctx context.Context, bucket string, objectName string) (minio.ObjectInfo, error) {
+	obj, err := c.S3Client.StatObjectWithContext(ctx, bucket, objectName, minio.StatObjectOptions{})
+	if err != nil {
+		return minio.ObjectInfo{}, err
+	}
+	return obj, nil
+}
+
+func (c *Client) PutObject(
+	ctx context.Context,
+	bucket string,
+	objectName string,
+	reader io.Reader,
+	size int64,
+) (int64, error) {
+	n, err := c.S3Client.PutObjectWithContext(ctx, bucket, objectName, reader, size, minio.PutObjectOptions{})
+	if err != nil {
+		return 0, fmt.Errorf("PutObject error: %w", err)
+	}
+	return n, nil
+}
+
 func ternary[T any](cond bool, trueVal, falseVal T) T {
 	if cond {
 		return trueVal

@@ -20,6 +20,9 @@ func Open(ctx context.Context, configPath string) (*App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load config: %w", err)
 	}
+	if cfg.Dedup.Mode != "report_only" && cfg.Dedup.Mode != "pointer" {
+		return nil, fmt.Errorf("Mode %q is not supported", cfg.Dedup.Mode)
+	}
 
 	s3Client, err := s3.NewClient(ctx, cfg)
 	if err != nil {

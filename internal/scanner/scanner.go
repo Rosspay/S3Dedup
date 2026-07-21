@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"runtime"
 	"s3-dedup/internal/cache"
 	"s3-dedup/internal/config"
@@ -33,6 +34,20 @@ type S3Client interface {
 		bucket string,
 		key string,
 	) (io.ReadCloser, error)
+
+	StatObject(
+		ctx context.Context,
+		bucket string,
+		objectName string,
+	) (minio.ObjectInfo, error)
+
+	PutObject(
+		ctx context.Context,
+		bucket string,
+		objectName string,
+		reader io.Reader,
+		size int64,
+	) (int64, error)
 }
 
 type Scanner struct {
@@ -86,7 +101,15 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 				defer wg.Done()
 
 				for job := range jobs {
-					processErr := s.processObject(ctx, job.buket, job.info, job.scanID)
+					var processErr error
+					switch s.config.Dedup.Mode {
+					case "report_only":
+						processErr = s.processObject(ctx, job.buket, job.info, job.scanID)
+					case "pointer":
+						processErr = s.processObjectPointer(ctx, job.buket, job.info, job.scanID)
+					default:
+						processErr = fmt.Errorf("Mode %q is not supported", s.config.Dedup.Mode)
+					}
 					if processErr != nil {
 						processErrors.Add(1)
 						fmt.Printf("Processing object %s/%s: %v\n", job.buket, job.info.Key, processErr)
@@ -96,7 +119,9 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 		}
 		err := s.s3Client.ListObjects(ctx, bucket.Name, bucket.Prefix, true,
 			func(info minio.ObjectInfo) error {
-
+				if bucket.Prefix == s.config.Dedup.BlobPrefix {
+					return nil
+				}
 				err := s.store.MarkObjectSeen(ctx, bucket.Name, info.Key, scanID)
 				if err != nil {
 					processErrors.Add(1)
@@ -167,6 +192,69 @@ func (s *Scanner) processObject(ctx context.Context, bucket string,
 		return err
 	}
 
+	err = s.register(ctx, bucket, info, hash, scanID)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info minio.ObjectInfo, scanID string) error {
+	obj, err := s.s3Client.GetObject(ctx, bucket, info.Key)
+	if err != nil {
+		return err
+	}
+	defer obj.Close()
+
+	temp, err := os.CreateTemp("", "s3-dedup-*")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		temp.Close()
+		os.Remove(temp.Name())
+	}()
+
+	tee := io.TeeReader(obj, temp)
+	hash, err := hashing.HashReader(tee, s.config.Dedup.HashAlgo)
+	if err != nil {
+		return err
+	}
+
+	blobKey := s.config.Dedup.BlobPrefix + hash
+	statInfo, err := s.s3Client.StatObject(ctx, bucket, blobKey)
+	errCode := minio.ToErrorResponse(err).Code
+	switch {
+	case err == nil:
+		if statInfo.Size != info.Size {
+			return fmt.Errorf("Consistency error: Blob %q size mismatch", blobKey)
+		}
+	case errCode == "NoSuchKey":
+		if _, err := temp.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		n, err := s.s3Client.PutObject(ctx, bucket, blobKey, temp, info.Size)
+		if err != nil {
+			return err
+		}
+		if n != info.Size {
+			return fmt.Errorf("Consistency for PutObject error: Blob %q size mismatch", blobKey)
+		}
+		fmt.Printf("Blob %s of size %d was put\n", blobKey, n)
+	default:
+		return fmt.Errorf("StatObject for blob %q: %w", blobKey, err)
+	}
+
+	err = s.register(ctx, bucket, info, hash, scanID)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Scanner) register(ctx context.Context, bucket string, info minio.ObjectInfo, hash string, scanID string) error {
 	record := cache.ObjectRecord{
 		Bucket:       bucket,
 		Key:          info.Key,
@@ -177,10 +265,9 @@ func (s *Scanner) processObject(ctx context.Context, bucket string,
 		LastSeenScan: scanID,
 	}
 
-	err = s.store.RegisterObject(ctx, record)
+	err := s.store.RegisterObject(ctx, record)
 	if err != nil {
 		return err
 	}
-
 	return nil
 }

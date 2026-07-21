@@ -11,9 +11,9 @@ s3:
     prefix: "my-prefix/"
 dedup:
   hash_algo: "sha256"
-  min_size_bytes: 200000 #
+  min_size_bytes: 4000 #
   blob_prefix: "blobs/"
-  mode: "report_only" # report_only | pointer
+  mode: "pointer" # report_only | pointer
   delete_originals: false # :
 cache:
   backend: "sqlite" # sqlite | leveldb
