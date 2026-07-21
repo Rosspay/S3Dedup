@@ -9,6 +9,7 @@ import (
 	"s3-dedup/internal/cache"
 	"s3-dedup/internal/config"
 	"s3-dedup/internal/hashing"
+	"s3-dedup/internal/pointer"
 	"s3-dedup/internal/report"
 	"sync"
 	"sync/atomic"
@@ -192,7 +193,7 @@ func (s *Scanner) processObject(ctx context.Context, bucket string,
 		return err
 	}
 
-	err = s.register(ctx, bucket, info, hash, scanID)
+	err = s.register(ctx, bucket, info, hash, info.Size, scanID)
 	if err != nil {
 		return err
 	}
@@ -201,6 +202,14 @@ func (s *Scanner) processObject(ctx context.Context, bucket string,
 }
 
 func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info minio.ObjectInfo, scanID string) error {
+	checkPointer, err := s.s3Client.StatObject(ctx, bucket, info.Key)
+	if err != nil {
+		return err
+	}
+	if checkPointer.ContentType == pointer.ContentPointerType {
+		return s.processPointer(ctx, bucket, info, scanID)
+	}
+
 	obj, err := s.s3Client.GetObject(ctx, bucket, info.Key)
 	if err != nil {
 		return err
@@ -246,7 +255,7 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 		return fmt.Errorf("StatObject for blob %q: %w", blobKey, err)
 	}
 
-	err = s.register(ctx, bucket, info, hash, scanID)
+	err = s.register(ctx, bucket, info, hash, info.Size, scanID)
 	if err != nil {
 		return err
 	}
@@ -254,12 +263,58 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 	return nil
 }
 
-func (s *Scanner) register(ctx context.Context, bucket string, info minio.ObjectInfo, hash string, scanID string) error {
+func (s *Scanner) processPointer(ctx context.Context, bucket string, info minio.ObjectInfo, scanID string) error {
+	obj, err := s.s3Client.GetObject(ctx, bucket, info.Key)
+	if err != nil {
+		return err
+	}
+	defer obj.Close()
+
+	p, err := pointer.ReadPointer(obj)
+	if err != nil {
+		return err
+	}
+	if p.BlobBucket != bucket {
+		return fmt.Errorf("Pointer %q bucket is %q, not %q", p.BlobKey, bucket, p.BlobBucket)
+	}
+	if p.BlobKey != s.config.Dedup.BlobPrefix+p.Hash {
+		return fmt.Errorf("Pointer key %q does not match %q", p.BlobKey, s.config.Dedup.BlobPrefix+p.Hash)
+	}
+
+	statInfo, err := s.s3Client.StatObject(ctx, p.BlobBucket, p.BlobKey)
+	if err != nil {
+		return err
+	}
+	if !comparePointerObject(p, statInfo) {
+		return fmt.Errorf("%q/%q: Pointer-object mismatch", bucket, info.Key)
+	}
+
+	err = s.register(ctx, bucket, info, p.Hash, p.Size, scanID)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func comparePointerObject(pointer *pointer.Pointer, obj minio.ObjectInfo) bool {
+	switch {
+	case pointer.BlobKey != obj.Key:
+		return false
+	case pointer.Size != obj.Size:
+		return false
+	}
+
+	return true
+}
+
+func (s *Scanner) register(ctx context.Context, bucket string, info minio.ObjectInfo, hash string, blobSize int64, scanID string) error {
 	record := cache.ObjectRecord{
 		Bucket:       bucket,
 		Key:          info.Key,
 		ETag:         info.ETag,
 		Size:         info.Size,
+		BlobSize:     blobSize,
 		LastModified: info.LastModified,
 		Hash:         hash,
 		LastSeenScan: scanID,

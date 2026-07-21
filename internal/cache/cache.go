@@ -20,6 +20,7 @@ type ObjectRecord struct {
 	Key          string
 	ETag         string
 	Size         int64
+	BlobSize     int64
 	LastModified time.Time
 	Hash         string
 	LastSeenScan string
