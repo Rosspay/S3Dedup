@@ -19,6 +19,8 @@ import (
 	"github.com/minio/minio-go/v6"
 )
 
+// Mocking S3 client for testing purposes
+// so we can simulate basic behavior and errors
 type MockS3Client struct {
 	objects    []minio.ObjectInfo
 	contents   map[string]string
@@ -27,6 +29,8 @@ type MockS3Client struct {
 	statErrors map[string]error
 	putErrors  map[string]error
 	putCalls   map[string]int
+	statCalls  map[string]int
+	statHooks  map[string]func(*MockS3Client, int)
 	listErr    error
 }
 
@@ -86,6 +90,7 @@ func (m *MockS3Client) PutObject(
 	objectName string,
 	reader io.Reader,
 	size int64,
+	contentType string,
 ) (int64, error) {
 	select {
 	case <-ctx.Done():
@@ -117,12 +122,21 @@ func (m *MockS3Client) PutObject(
 		m.stats = make(map[string]minio.ObjectInfo)
 	}
 	m.contents[id] = string(data)
-	m.stats[id] = minio.ObjectInfo{
+	info := minio.ObjectInfo{
 		Key:          objectName,
 		Size:         int64(len(data)),
-		ETag:         "etag-" + objectName,
+		ETag:         fmt.Sprintf("etag-%s-%d", objectName, m.putCalls[id]),
 		LastModified: time.Now().UTC(),
+		ContentType:  contentType,
 	}
+	m.stats[id] = info
+	for i := range m.objects {
+		if m.objects[i].Key == objectName {
+			m.objects[i] = info
+			return int64(len(data)), nil
+		}
+	}
+	m.objects = append(m.objects, info)
 	return int64(len(data)), nil
 }
 
@@ -138,6 +152,13 @@ func (m *MockS3Client) StatObject(
 	}
 
 	id := objectID(bucket, objectName)
+	if m.statCalls == nil {
+		m.statCalls = make(map[string]int)
+	}
+	m.statCalls[id]++
+	if hook := m.statHooks[id]; hook != nil {
+		hook(m, m.statCalls[id])
+	}
 	if err := m.statErrors[id]; err != nil {
 		return minio.ObjectInfo{}, err
 	}
@@ -681,6 +702,161 @@ func TestPointerModePointerCanReferenceBlobInDifferentBucket(t *testing.T) {
 	}
 	if result.UniqueBlobs != 1 {
 		t.Errorf("UniqueBlobs = %d, expected 1", result.UniqueBlobs)
+	}
+}
+
+func TestPointerModeChangedObjectAfterListingIsNotReplaced(t *testing.T) {
+	const key = "document.txt"
+	const originalContent = "old-data"
+	const changedContent = "new-data"
+
+	store := openTestStore(t)
+	listedInfo := objectInfo(key, int64(len(originalContent)))
+	client := &MockS3Client{
+		objects: []minio.ObjectInfo{listedInfo},
+		contents: map[string]string{
+			objectID("bucket", key): originalContent,
+		},
+		stats: map[string]minio.ObjectInfo{
+			objectID("bucket", key): listedInfo,
+		},
+	}
+	client.statHooks = map[string]func(*MockS3Client, int){
+		objectID("bucket", key): func(m *MockS3Client, call int) {
+			if call != 2 {
+				return
+			}
+			changedInfo := listedInfo
+			changedInfo.ETag = "etag-changed"
+			changedInfo.LastModified = listedInfo.LastModified.Add(time.Second)
+			m.contents[objectID("bucket", key)] = changedContent
+			m.stats[objectID("bucket", key)] = changedInfo
+		},
+	}
+	cfg := pointerTestConfig()
+	cfg.Dedup.DeleteOriginals = true
+
+	result, err := NewScanner(client, store, cfg).ScanOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ScanOnce error: %v", err)
+	}
+	if got := client.content(objectID("bucket", key)); got != changedContent {
+		t.Errorf("changed object content = %q, expected %q", got, changedContent)
+	}
+	if got := client.putCallCount("bucket", key); got != 0 {
+		t.Errorf("pointer PutObject calls = %d, expected 0", got)
+	}
+	if result.ObjectsRelinked != 0 {
+		t.Errorf("ObjectsRelinked = %d, expected 0", result.ObjectsRelinked)
+	}
+	if result.BytesReclaimed != 0 {
+		t.Errorf("BytesReclaimed = %d, expected 0", result.BytesReclaimed)
+	}
+}
+
+func TestPointerModePointerWriteErrorDoesNotRegisterReference(t *testing.T) {
+	const key = "original.txt"
+	const content = "pointer write must fail"
+
+	store := openTestStore(t)
+	cfg := pointerTestConfig()
+	cfg.Dedup.DeleteOriginals = true
+	hash := hashContent(t, content)
+	blobKey := cfg.Dedup.BlobPrefix + hash
+	info := objectInfo(key, int64(len(content)))
+	client := &MockS3Client{
+		objects: []minio.ObjectInfo{info},
+		contents: map[string]string{
+			objectID("bucket", key):     content,
+			objectID("bucket", blobKey): content,
+		},
+		stats: map[string]minio.ObjectInfo{
+			objectID("bucket", key):     info,
+			objectID("bucket", blobKey): objectInfo(blobKey, int64(len(content))),
+		},
+		putErrors: map[string]error{
+			objectID("bucket", key): errors.New("simulated pointer upload error"),
+		},
+	}
+
+	result, err := NewScanner(client, store, cfg).ScanOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ScanOnce error: %v", err)
+	}
+	if result.Errors != 1 {
+		t.Errorf("Errors = %d, expected 1", result.Errors)
+	}
+	if result.ObjectsRelinked != 0 {
+		t.Errorf("ObjectsRelinked = %d, expected 0", result.ObjectsRelinked)
+	}
+	if got := client.content(objectID("bucket", key)); got != content {
+		t.Errorf("original content = %q, expected %q", got, content)
+	}
+	stats, err := store.GetStats(context.Background())
+	if err != nil {
+		t.Fatalf("GetStats error: %v", err)
+	}
+	if stats.UniqueBlobs != 0 || stats.DuplicatesFound != 0 || stats.BytesReclaimable != 0 {
+		t.Errorf("cache was changed after failed pointer upload: %+v", stats)
+	}
+}
+
+func TestPointerModeNextScanRecognizesPointerWithoutCreatingBlobAgain(t *testing.T) {
+	const key = "document.txt"
+	const content = "content converted to pointer"
+
+	firstStore := openTestStore(t)
+	info := objectInfo(key, int64(len(content)))
+	client := &MockS3Client{
+		objects: []minio.ObjectInfo{info},
+		contents: map[string]string{
+			objectID("bucket", key): content,
+		},
+		stats: map[string]minio.ObjectInfo{
+			objectID("bucket", key): info,
+		},
+	}
+	cfg := pointerTestConfig()
+	cfg.Dedup.DeleteOriginals = true
+	scanner := NewScanner(client, firstStore, cfg)
+
+	firstResult, err := scanner.ScanOnce(context.Background())
+	if err != nil {
+		t.Fatalf("first ScanOnce error: %v", err)
+	}
+	if firstResult.Errors != 0 || firstResult.ObjectsRelinked != 1 {
+		t.Fatalf("first result = errors %d, relinked %d; expected 0 and 1", firstResult.Errors, firstResult.ObjectsRelinked)
+	}
+	hash := hashContent(t, content)
+	blobKey := cfg.Dedup.BlobPrefix + hash
+	blobPutCalls := client.putCallCount("bucket", blobKey)
+	pointerPutCalls := client.putCallCount("bucket", key)
+	if blobPutCalls != 1 || pointerPutCalls != 1 {
+		t.Fatalf("first PutObject calls = blob %d, pointer %d; expected 1 and 1", blobPutCalls, pointerPutCalls)
+	}
+	if got := client.stats[objectID("bucket", key)].ContentType; got != pointer.ContentPointerType {
+		t.Fatalf("pointer ContentType = %q, expected %q", got, pointer.ContentPointerType)
+	}
+
+	secondStore := openTestStore(t)
+	secondResult, err := NewScanner(client, secondStore, cfg).ScanOnce(context.Background())
+	if err != nil {
+		t.Fatalf("second ScanOnce error: %v", err)
+	}
+	if secondResult.Errors != 0 {
+		t.Errorf("second Errors = %d, expected 0", secondResult.Errors)
+	}
+	if secondResult.ObjectsRelinked != 0 {
+		t.Errorf("second ObjectsRelinked = %d, expected 0", secondResult.ObjectsRelinked)
+	}
+	if got := client.putCallCount("bucket", blobKey); got != blobPutCalls {
+		t.Errorf("blob PutObject calls after second scan = %d, expected %d", got, blobPutCalls)
+	}
+	if got := client.putCallCount("bucket", key); got != pointerPutCalls {
+		t.Errorf("pointer PutObject calls after second scan = %d, expected %d", got, pointerPutCalls)
+	}
+	if secondResult.UniqueBlobs != 1 {
+		t.Errorf("second UniqueBlobs = %d, expected 1", secondResult.UniqueBlobs)
 	}
 }
 

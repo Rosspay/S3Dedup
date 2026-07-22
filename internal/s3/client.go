@@ -96,8 +96,9 @@ func (c *Client) PutObject(
 	objectName string,
 	reader io.Reader,
 	size int64,
+	contentType string,
 ) (int64, error) {
-	n, err := c.S3Client.PutObjectWithContext(ctx, bucket, objectName, reader, size, minio.PutObjectOptions{})
+	n, err := c.S3Client.PutObjectWithContext(ctx, bucket, objectName, reader, size, minio.PutObjectOptions{ContentType: contentType})
 	if err != nil {
 		return 0, fmt.Errorf("PutObject error: %w", err)
 	}
