@@ -11,6 +11,7 @@ import (
 	"s3-dedup/internal/hashing"
 	"s3-dedup/internal/pointer"
 	"s3-dedup/internal/report"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -120,7 +121,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 		}
 		err := s.s3Client.ListObjects(ctx, bucket.Name, bucket.Prefix, true,
 			func(info minio.ObjectInfo) error {
-				if bucket.Prefix == s.config.Dedup.BlobPrefix {
+				if strings.HasPrefix(info.Key, s.config.Dedup.BlobPrefix) {
 					return nil
 				}
 				err := s.store.MarkObjectSeen(ctx, bucket.Name, info.Key, scanID)
@@ -273,9 +274,6 @@ func (s *Scanner) processPointer(ctx context.Context, bucket string, info minio.
 	p, err := pointer.ReadPointer(obj)
 	if err != nil {
 		return err
-	}
-	if p.BlobBucket != bucket {
-		return fmt.Errorf("Pointer %q bucket is %q, not %q", p.BlobKey, bucket, p.BlobBucket)
 	}
 	if p.BlobKey != s.config.Dedup.BlobPrefix+p.Hash {
 		return fmt.Errorf("Pointer key %q does not match %q", p.BlobKey, s.config.Dedup.BlobPrefix+p.Hash)

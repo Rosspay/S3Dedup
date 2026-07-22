@@ -100,7 +100,7 @@ func (s *SQLiteStore) RegisterObject(ctx context.Context, object ObjectRecord) e
 
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		if err := incrementBlob(ctx, tx, object.Hash, object.Size); err != nil {
+		if err := incrementBlob(ctx, tx, object.Hash, object.BlobSize); err != nil {
 			return fmt.Errorf("register object %q/%q: %w", object.Bucket, object.Key, err)
 		}
 		if _, err := tx.ExecContext(ctx, `
@@ -136,7 +136,7 @@ func (s *SQLiteStore) RegisterObject(ctx context.Context, object ObjectRecord) e
 			return fmt.Errorf("register object %q/%q: update metadata: %w", object.Bucket, object.Key, err)
 		}
 	default:
-		if err := incrementBlob(ctx, tx, object.Hash, object.Size); err != nil {
+		if err := incrementBlob(ctx, tx, object.Hash, object.BlobSize); err != nil {
 			return fmt.Errorf("register object %q/%q: %w", object.Bucket, object.Key, err)
 		}
 		if err := decrementBlob(ctx, tx, oldHash); err != nil {
