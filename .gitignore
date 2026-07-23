@@ -30,3 +30,4 @@ internal/hashing/cover.txt
 cmd/s3-dedup/state.db
 cmd/s3-dedup/state.db
 cmd/s3-dedup/report.json
+/testdata

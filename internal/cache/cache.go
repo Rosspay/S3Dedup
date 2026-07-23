@@ -17,6 +17,8 @@ type Store interface {
 
 type ObjectRecord struct {
 	Bucket       string
+	BlobBucket   string
+	BlobKey      string
 	Key          string
 	ETag         string
 	Size         int64

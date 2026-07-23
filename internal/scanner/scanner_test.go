@@ -860,6 +860,150 @@ func TestPointerModeNextScanRecognizesPointerWithoutCreatingBlobAgain(t *testing
 	}
 }
 
+func TestBlobReferencesAreIndependentAcrossBuckets(t *testing.T) {
+	const (
+		hash = "same-hash"
+		size = int64(100)
+	)
+
+	ctx := context.Background()
+	store := openTestStore(t)
+	makeRecord := func(bucket, key, blobBucket string) cache.ObjectRecord {
+		return cache.ObjectRecord{
+			Bucket:       bucket,
+			Key:          key,
+			ETag:         "etag-" + key,
+			Size:         size,
+			BlobBucket:   blobBucket,
+			BlobKey:      "blobs/" + hash,
+			BlobSize:     size,
+			LastModified: time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC),
+			Hash:         hash,
+			LastSeenScan: "scan-1",
+		}
+	}
+
+	objects := []cache.ObjectRecord{
+		makeRecord("source-a", "a-1.txt", "blob-bucket-a"),
+		makeRecord("source-a", "a-2.txt", "blob-bucket-a"),
+		makeRecord("source-b", "b-1.txt", "blob-bucket-b"),
+		makeRecord("source-b", "b-2.txt", "blob-bucket-b"),
+	}
+	for _, object := range objects {
+		if err := store.RegisterObject(ctx, object); err != nil {
+			t.Fatalf("RegisterObject %q/%q: %v", object.Bucket, object.Key, err)
+		}
+	}
+
+	stats, err := store.GetStats(ctx)
+	if err != nil {
+		t.Fatalf("GetStats error: %v", err)
+	}
+	if stats.UniqueBlobs != 2 || stats.DuplicatesFound != 2 || stats.BytesReclaimable != 2*size {
+		t.Fatalf("stats before unregister = %+v, expected 2 blobs, 2 duplicates, %d bytes", stats, 2*size)
+	}
+
+	if err := store.UnregisterObject(ctx, "source-a", "a-1.txt"); err != nil {
+		t.Fatalf("UnregisterObject error: %v", err)
+	}
+
+	stats, err = store.GetStats(ctx)
+	if err != nil {
+		t.Fatalf("GetStats after unregister error: %v", err)
+	}
+	if stats.UniqueBlobs != 2 || stats.DuplicatesFound != 1 || stats.BytesReclaimable != size {
+		t.Errorf("stats after unregister = %+v, expected 2 blobs, 1 duplicate, %d bytes", stats, size)
+	}
+}
+
+func TestRegisterObjectMovesReferenceBetweenBlobBuckets(t *testing.T) {
+	const (
+		hash = "same-hash"
+		size = int64(100)
+	)
+
+	ctx := context.Background()
+	store := openTestStore(t)
+	makeRecord := func(key, blobBucket string) cache.ObjectRecord {
+		record := record("source", key, hash, size)
+		record.BlobBucket = blobBucket
+		return record
+	}
+
+	moving := makeRecord("moving.txt", "blob-bucket-a")
+	objects := []cache.ObjectRecord{
+		moving,
+		makeRecord("anchor-a.txt", "blob-bucket-a"),
+		makeRecord("anchor-b.txt", "blob-bucket-b"),
+	}
+	for _, object := range objects {
+		if err := store.RegisterObject(ctx, object); err != nil {
+			t.Fatalf("RegisterObject %q/%q: %v", object.Bucket, object.Key, err)
+		}
+	}
+
+	moving.BlobBucket = "blob-bucket-b"
+	moving.ETag = "etag-moved"
+	moving.LastSeenScan = "scan-2"
+	if err := store.RegisterObject(ctx, moving); err != nil {
+		t.Fatalf("move object reference: %v", err)
+	}
+
+	if err := store.UnregisterObject(ctx, "source", "anchor-a.txt"); err != nil {
+		t.Fatalf("UnregisterObject anchor-a.txt: %v", err)
+	}
+
+	stats, err := store.GetStats(ctx)
+	if err != nil {
+		t.Fatalf("GetStats error: %v", err)
+	}
+	if stats.UniqueBlobs != 1 || stats.DuplicatesFound != 1 || stats.BytesReclaimable != size {
+		t.Errorf("stats after moving reference = %+v, expected 1 blob, 1 duplicate, %d bytes", stats, size)
+	}
+}
+
+func TestFinalizeScopeDecrementsOnlyMatchingBlobBucket(t *testing.T) {
+	const (
+		hash = "same-hash"
+		size = int64(100)
+	)
+
+	ctx := context.Background()
+	store := openTestStore(t)
+	makeRecord := func(key, blobBucket, scanID string) cache.ObjectRecord {
+		record := record("source", key, hash, size)
+		record.BlobBucket = blobBucket
+		record.LastSeenScan = scanID
+		return record
+	}
+
+	objects := []cache.ObjectRecord{
+		makeRecord("docs/stale-a.txt", "blob-bucket-a", "scan-1"),
+		makeRecord("docs/current-a.txt", "blob-bucket-a", "scan-2"),
+		makeRecord("docs/current-b-one.txt", "blob-bucket-b", "scan-2"),
+		makeRecord("docs/current-b-two.txt", "blob-bucket-b", "scan-2"),
+	}
+	for _, object := range objects {
+		if err := store.RegisterObject(ctx, object); err != nil {
+			t.Fatalf("RegisterObject %q/%q: %v", object.Bucket, object.Key, err)
+		}
+	}
+
+	removed, err := store.FinalizeScope(ctx, "source", "docs/", "scan-2")
+	if err != nil {
+		t.Fatalf("FinalizeScope error: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("FinalizeScope removed = %d, expected 1", removed)
+	}
+
+	for _, key := range []string{"docs/current-b-one.txt", "docs/current-b-two.txt"} {
+		if err := store.UnregisterObject(ctx, "source", key); err != nil {
+			t.Errorf("UnregisterObject %q after FinalizeScope: %v", key, err)
+		}
+	}
+}
+
 func openTestStore(t *testing.T) *cache.SQLiteStore {
 	t.Helper()
 
@@ -894,6 +1038,8 @@ func testConfig() *config.Config {
 func record(bucket, key, hash string, size int64) cache.ObjectRecord {
 	return cache.ObjectRecord{
 		Bucket:       bucket,
+		BlobBucket:   bucket,
+		BlobKey:      "blobs/" + hash,
 		Key:          key,
 		ETag:         "etag",
 		Size:         size,

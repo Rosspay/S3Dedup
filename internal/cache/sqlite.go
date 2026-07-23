@@ -54,9 +54,12 @@ func (s *SQLiteStore) initialize(ctx context.Context) error {
 		`PRAGMA journal_mode = WAL`,
 		`PRAGMA busy_timeout = 5000`,
 		`CREATE TABLE IF NOT EXISTS blobs (
-			hash TEXT PRIMARY KEY,
+			bucket TEXT NOT NULL,
+			blob_key TEXT NOT NULL,
+			hash TEXT NOT NULL,
 			size INTEGER NOT NULL CHECK (size >= 0),
-			ref_count INTEGER NOT NULL CHECK (ref_count >= 0)
+			ref_count INTEGER NOT NULL CHECK (ref_count >= 0),
+			PRIMARY KEY (bucket, hash)
 		)`,
 		`CREATE TABLE IF NOT EXISTS objects (
 			bucket TEXT NOT NULL,
@@ -64,12 +67,13 @@ func (s *SQLiteStore) initialize(ctx context.Context) error {
 			etag TEXT NOT NULL,
 			size INTEGER NOT NULL CHECK (size >= 0),
 			last_modified TEXT NOT NULL,
+			blob_bucket TEXT NOT NULL,
 			blob_hash TEXT NOT NULL,
 			last_seen_scan TEXT NOT NULL,
 			PRIMARY KEY (bucket, object_key),
-			FOREIGN KEY (blob_hash) REFERENCES blobs(hash)
+			FOREIGN KEY (blob_bucket, blob_hash) REFERENCES blobs(bucket, hash)
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_objects_blob_hash ON objects(blob_hash)`,
+		`CREATE INDEX IF NOT EXISTS idx_objects_blob_bucket_blob_hash ON objects(blob_bucket, blob_hash)`,
 	}
 
 	for _, statement := range statements {
@@ -92,27 +96,29 @@ func (s *SQLiteStore) RegisterObject(ctx context.Context, object ObjectRecord) e
 	}
 	defer tx.Rollback()
 
+	var oldBlobBucket string
 	var oldHash string
 	err = tx.QueryRowContext(ctx,
-		`SELECT blob_hash FROM objects WHERE bucket = ? AND object_key = ?`,
+		`SELECT blob_bucket, blob_hash FROM objects WHERE bucket = ? AND object_key = ?`,
 		object.Bucket,
-		object.Key).Scan(&oldHash)
+		object.Key).Scan(&oldBlobBucket, &oldHash)
 
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		if err := incrementBlob(ctx, tx, object.Hash, object.BlobSize); err != nil {
+		if err := incrementBlob(ctx, tx, object.BlobBucket, object.BlobKey, object.Hash, object.BlobSize); err != nil {
 			return fmt.Errorf("register object %q/%q: %w", object.Bucket, object.Key, err)
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO objects (
-				bucket, object_key, etag, size, last_modified, blob_hash, last_seen_scan
-			) VALUES (?, ?, ?, ?, ?, ?, ?)
+				bucket, object_key, etag, size, last_modified, blob_bucket, blob_hash, last_seen_scan
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		`,
 			object.Bucket,
 			object.Key,
 			object.ETag,
 			object.Size,
 			object.LastModified.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"),
+			object.BlobBucket,
 			object.Hash,
 			object.LastSeenScan,
 		); err != nil {
@@ -120,7 +126,7 @@ func (s *SQLiteStore) RegisterObject(ctx context.Context, object ObjectRecord) e
 		}
 	case err != nil:
 		return fmt.Errorf("register object %q/%q: read current state: %w", object.Bucket, object.Key, err)
-	case oldHash == object.Hash:
+	case oldBlobBucket == object.BlobBucket && oldHash == object.Hash:
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE objects
 			SET etag = ?, size = ?, last_modified = ?, last_seen_scan = ?
@@ -136,20 +142,21 @@ func (s *SQLiteStore) RegisterObject(ctx context.Context, object ObjectRecord) e
 			return fmt.Errorf("register object %q/%q: update metadata: %w", object.Bucket, object.Key, err)
 		}
 	default:
-		if err := incrementBlob(ctx, tx, object.Hash, object.BlobSize); err != nil {
+		if err := incrementBlob(ctx, tx, object.BlobBucket, object.BlobKey, object.Hash, object.BlobSize); err != nil {
 			return fmt.Errorf("register object %q/%q: %w", object.Bucket, object.Key, err)
 		}
-		if err := decrementBlob(ctx, tx, oldHash); err != nil {
+		if err := decrementBlob(ctx, tx, oldBlobBucket, oldHash); err != nil {
 			return fmt.Errorf("register object %q/%q: %w", object.Bucket, object.Key, err)
 		}
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE objects
-			SET etag = ?, size = ?, last_modified = ?, blob_hash = ?, last_seen_scan = ?
+			SET etag = ?, size = ?, last_modified = ?, blob_bucket = ?, blob_hash = ?, last_seen_scan = ?
 			WHERE bucket = ? AND object_key = ?
 		`,
 			object.ETag,
 			object.Size,
 			object.LastModified.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"),
+			object.BlobBucket,
 			object.Hash,
 			object.LastSeenScan,
 			object.Bucket,
@@ -175,12 +182,13 @@ func (s *SQLiteStore) UnregisterObject(
 	}
 	defer tx.Rollback()
 
+	var blobBucket string
 	var hash string
 	err = tx.QueryRowContext(ctx, `
-        SELECT blob_hash
+        SELECT blob_bucket, blob_hash
         FROM objects
         WHERE bucket = ? AND object_key = ?
-    `, bucket, key).Scan(&hash)
+    `, bucket, key).Scan(&blobBucket, &hash)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil
@@ -195,7 +203,7 @@ func (s *SQLiteStore) UnregisterObject(
 		return fmt.Errorf("unregister object %q/%q: delete object: %w", bucket, key, err)
 	}
 
-	if err := decrementBlob(ctx, tx, hash); err != nil {
+	if err := decrementBlob(ctx, tx, blobBucket, hash); err != nil {
 		return fmt.Errorf("unregister object %q/%q: %w", bucket, key, err)
 	}
 
@@ -223,7 +231,7 @@ func (s *SQLiteStore) IsObjectUnchanged(
 	`
 
 	var found int
-	err := s.db.QueryRowContext(ctx, query, bucket, size, etag, size, lastModified).Scan(&found)
+	err := s.db.QueryRowContext(ctx, query, bucket, key, etag, size, lastModified).Scan(&found)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return false, nil
@@ -248,38 +256,58 @@ func validateObject(object ObjectRecord) error {
 	}
 }
 
-func incrementBlob(ctx context.Context, tx *sql.Tx, hash string, size int64) error {
+func incrementBlob(ctx context.Context, tx *sql.Tx, bucket, blobKey string, hash string, size int64) error {
+	var storedBlobKey string
 	var storedSize int64
-	err := tx.QueryRowContext(ctx, `SELECT size FROM blobs WHERE hash = ?`, hash).Scan(&storedSize)
+	err := tx.QueryRowContext(ctx,
+		`SELECT blob_key, size FROM blobs 
+		WHERE bucket = ?
+		AND hash = ?`, bucket, hash).Scan(&storedBlobKey, &storedSize)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		//Insert new blob
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO blobs (hash, size, ref_count) VALUES (?, ?, 1)`,
+			`INSERT INTO blobs (bucket, blob_key, hash, size, ref_count) VALUES (?, ?, ?, ?, 1)`,
+			bucket,
+			blobKey,
 			hash,
 			size,
 		); err != nil {
 			return fmt.Errorf("insert blob %q: %w", hash, err)
 		}
 		return nil
+	case storedBlobKey == blobKey && storedSize == size:
+		// Update ref_count for blobs, that already was in cache
+		row, err := tx.ExecContext(ctx,
+			`UPDATE blobs SET ref_count = ref_count + 1 
+			WHERE bucket = ? AND hash = ? AND blob_key = ?`,
+			bucket,
+			hash,
+			blobKey,
+		)
+		rowsAffected, _ := row.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("increment blob %q refcount: %w", hash, err)
+		}
+		if rowsAffected != 1 {
+			return fmt.Errorf("increment blob %q refcount, no rows affected", hash)
+		}
 	case err != nil:
 		return fmt.Errorf("read blob %q: %w", hash, err)
 	case storedSize != size:
 		return fmt.Errorf("blob %q size mismatch: stored %d, object %d", hash, storedSize, size)
+	case storedBlobKey != blobKey:
+		return fmt.Errorf("blob %q key mismatch: stored %q, got %q", hash, storedBlobKey, blobKey)
+
 	}
-	// Update ref_count for blobs, that already was in cache
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE blobs SET ref_count = ref_count + 1 WHERE hash = ?`,
-		hash,
-	); err != nil {
-		return fmt.Errorf("increment blob %q refcount: %w", hash, err)
-	}
+
 	return nil
 }
 
-func decrementBlob(ctx context.Context, tx *sql.Tx, hash string) error {
+func decrementBlob(ctx context.Context, tx *sql.Tx, bucket string, hash string) error {
 	result, err := tx.ExecContext(ctx,
-		`UPDATE blobs SET ref_count = ref_count - 1 WHERE hash = ? AND ref_count > 0`,
+		`UPDATE blobs SET ref_count = ref_count - 1 WHERE bucket = ? AND hash = ? AND ref_count > 0`,
+		bucket,
 		hash,
 	)
 	if err != nil {
@@ -304,10 +332,10 @@ func (s *SQLiteStore) GetStats(ctx context.Context) (Stats, error) {
 			COALESCE(SUM(CASE WHEN object_count > 1 THEN object_count - 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN object_count > 1 THEN (object_count - 1) * size ELSE 0 END), 0)
 		FROM (
-			SELECT o.blob_hash, COUNT(*) AS object_count, b.size AS size
+			SELECT o.blob_bucket, o.blob_hash, COUNT(*) AS object_count, b.size AS size
 			FROM objects AS o
-			JOIN blobs AS b ON b.hash = o.blob_hash
-			GROUP BY o.blob_hash, b.size
+			JOIN blobs AS b ON b.bucket = o.blob_bucket AND b.hash = o.blob_hash
+			GROUP BY o.blob_bucket, o.blob_hash, b.size
 		)
 	`
 	var stats Stats
@@ -349,32 +377,37 @@ func (s *SQLiteStore) FinalizeScope(ctx context.Context, bucket, prefix, scanID 
 
 	// Hash and number of objects that hasn't been discovered during this scan
 	rows, err := tx.QueryContext(ctx,
-		`SELECT blob_hash, COUNT(*) 
+		`SELECT blob_bucket, blob_hash, COUNT(*) 
 	FROM objects 
 	WHERE bucket = ? 
 	AND substr(object_key, 1, length(?)) = ?
 	AND last_seen_scan <> ?
-	GROUP BY blob_hash`, bucket, prefix, prefix, scanID,
+	GROUP BY blob_bucket, blob_hash`, bucket, prefix, prefix, scanID,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("FinalizeScope query failed: %w", err)
 	}
-	var blobsCount = make(map[string]int)
+	type blobID struct {
+		bucket string
+		hash   string
+	}
+	var blobsCount = make(map[blobID]int)
 	for rows.Next() {
+		var bucket string
 		var hash string
 		var cnt int
-		err := rows.Scan(&hash, &cnt)
+		err := rows.Scan(&bucket, &hash, &cnt)
 		if err != nil {
 			return 0, fmt.Errorf("row scan failed: %w", err)
 		}
-		blobsCount[hash] = cnt
+		blobsCount[blobID{bucket: bucket, hash: hash}] = cnt
 	}
 	// Updating ref_count for blobs
 	for key, value := range blobsCount {
 		_, err := tx.ExecContext(ctx,
 			`UPDATE blobs
 		SET ref_count = ref_count - ?
-		WHERE hash = ?`, value, key)
+		WHERE bucket = ? AND hash = ?`, value, key.bucket, key.hash)
 		if err != nil {
 			return 0, fmt.Errorf("Error updating ref_count for %q: %w", key, err)
 		}

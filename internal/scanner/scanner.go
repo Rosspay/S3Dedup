@@ -211,7 +211,7 @@ func (s *Scanner) processObject(ctx context.Context, bucket string,
 		return err
 	}
 
-	err = s.register(ctx, bucket, info, hash, info.Size, scanID)
+	err = s.register(ctx, bucket, bucket, s.config.Dedup.BlobPrefix+hash, info, hash, info.Size, scanID)
 	if err != nil {
 		return err
 	}
@@ -295,7 +295,7 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 		relinked = true
 	}
 
-	err = s.register(ctx, bucket, res, hash, info.Size, scanID)
+	err = s.register(ctx, bucket, bucket, blobKey, res, hash, info.Size, scanID)
 	if err != nil {
 		return 0, false, err
 	}
@@ -326,7 +326,7 @@ func (s *Scanner) processPointer(ctx context.Context, bucket string, info minio.
 		return fmt.Errorf("%q/%q: Pointer-object mismatch", bucket, info.Key)
 	}
 
-	err = s.register(ctx, bucket, info, p.Hash, p.Size, scanID)
+	err = s.register(ctx, bucket, p.BlobBucket, p.BlobKey, info, p.Hash, p.Size, scanID)
 	if err != nil {
 		return err
 	}
@@ -386,9 +386,20 @@ func comparePointerObject(pointer *pointer.Pointer, obj minio.ObjectInfo) bool {
 	return true
 }
 
-func (s *Scanner) register(ctx context.Context, bucket string, info minio.ObjectInfo, hash string, blobSize int64, scanID string) error {
+func (s *Scanner) register(
+	ctx context.Context,
+	bucket string,
+	blobBucket string,
+	blobKey string,
+	info minio.ObjectInfo,
+	hash string,
+	blobSize int64,
+	scanID string,
+) error {
 	record := cache.ObjectRecord{
 		Bucket:       bucket,
+		BlobBucket:   blobBucket,
+		BlobKey:      blobKey,
 		Key:          info.Key,
 		ETag:         info.ETag,
 		Size:         info.Size,
