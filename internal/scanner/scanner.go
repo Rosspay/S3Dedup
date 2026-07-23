@@ -3,6 +3,7 @@ package scanner
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -52,6 +53,12 @@ type S3Client interface {
 		size int64,
 		contentType string,
 	) (int64, error)
+
+	RemoveObjects(
+		ctx context.Context,
+		bucket string,
+		keys []string,
+	) ([]string, error)
 }
 
 type Scanner struct {
@@ -97,7 +104,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 		scanReport.ObjectsScanned = objectsScanned.Load()
 		scanReport.Errors += processErrors.Load()
 		scanReport.ObjectsRelinked = objectsRelinked.Load()
-		scanReport.BytesReclaimed = bytesReclaimed.Load()
+		scanReport.BytesReclaimed += bytesReclaimed.Load()
 	}()
 
 	for _, bucket := range s.config.S3.Buckets {
@@ -146,7 +153,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 					processErrors.Add(1)
 					return fmt.Errorf("MarkObjectSeen error for %q: %w\n", info.Key, err)
 				}
-				if info.Size < s.config.Dedup.MinSizeBytes {
+				if info.Size < s.config.Dedup.MinSizeBytes && info.ContentType != pointer.ContentPointerType {
 					return s.store.UnregisterObject(ctx, bucket.Name, info.Key)
 				}
 				objectsScanned.Add(1)
@@ -182,7 +189,16 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 			scanReport.Errors++
 			return scanReport, fmt.Errorf("FinalizeScope for %q/%q: %w", bucket.Name, bucket.Prefix, err)
 		}
+
 	}
+	gcBytes, removedBlobs, err := s.collectGarbage(ctx)
+	if err != nil {
+		scanReport.Errors++
+		return scanReport, fmt.Errorf("garbage collection: %w", err)
+	}
+
+	scanReport.BytesReclaimed += gcBytes
+	fmt.Printf("Blobs removed: %d, bytes reclaimed: %d\n", removedBlobs, gcBytes)
 	stats, err := s.store.GetStats(ctx)
 	if err != nil {
 		scanReport.Errors++
@@ -364,6 +380,94 @@ func (s *Scanner) safeDelete(ctx context.Context, bucket string, info minio.Obje
 	}
 
 	return obj, nil
+}
+
+func (s *Scanner) collectGarbage(ctx context.Context) (int64, int64, error) {
+	var bytesReclaimed int64
+	var blobsRemoved int64
+	var errs []error
+
+	seenBuckets := make(map[string]struct{})
+	for _, configured := range s.config.S3.Buckets {
+		bucket := configured.Name
+		if _, exists := seenBuckets[bucket]; exists {
+			continue
+		}
+		seenBuckets[bucket] = struct{}{}
+
+		blobs, err := s.store.ListUnreferencedBlobs(ctx, bucket)
+		if err != nil {
+			errs = append(errs, fmt.Errorf(
+				"list unreferenced blobs in %q: %w",
+				bucket,
+				err,
+			))
+			continue
+		}
+		if len(blobs) == 0 {
+			continue
+		}
+
+		keys := make([]string, 0, len(blobs))
+		byKey := make(map[string]cache.BlobRecord, len(blobs))
+		for _, blob := range blobs {
+			if _, exists := byKey[blob.Key]; exists {
+				errs = append(errs, fmt.Errorf(
+					"duplicate blob key %q/%q in cache",
+					bucket,
+					blob.Key,
+				))
+				continue
+			}
+			keys = append(keys, blob.Key)
+			byKey[blob.Key] = blob
+		}
+
+		deletedKeys, removeErr := s.s3Client.RemoveObjects(
+			ctx,
+			bucket,
+			keys,
+		)
+
+		for _, key := range deletedKeys {
+			blob, exists := byKey[key]
+			if !exists {
+				errs = append(errs, fmt.Errorf(
+					"S3 returned unknown deleted key %q/%q",
+					bucket,
+					key,
+				))
+				continue
+			}
+
+			if err := s.store.DeleteUnreferencedBlob(
+				ctx,
+				blob.Bucket,
+				blob.Hash,
+			); err != nil {
+				errs = append(errs, fmt.Errorf(
+					"delete blob %q/%q from cache: %w",
+					blob.Bucket,
+					blob.Key,
+					err,
+				))
+				continue
+			}
+
+			blobsRemoved++
+			bytesReclaimed += blob.Size
+		}
+
+		if removeErr != nil {
+			errs = append(errs, fmt.Errorf(
+				"remove unreferenced blobs from %q: %w",
+				bucket,
+				removeErr,
+			))
+		}
+	}
+
+	return bytesReclaimed, blobsRemoved, errors.Join(errs...)
 }
 
 func isObjectChanged(objBefore minio.ObjectInfo, objAfter minio.ObjectInfo) bool {

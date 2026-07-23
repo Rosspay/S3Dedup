@@ -182,6 +182,14 @@ func (m *MockS3Client) StatObject(
 	}
 }
 
+func (m *MockS3Client) RemoveObjects(
+	ctx context.Context,
+	bucket string,
+	keys []string,
+) ([]string, error) {
+	return nil, nil
+}
+
 func TestScanOnceFindDuplicateContent(t *testing.T) {
 	const content = "duplicate"
 	const expObjectsScanned = 2

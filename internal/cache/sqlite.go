@@ -432,6 +432,55 @@ func (s *SQLiteStore) FinalizeScope(ctx context.Context, bucket, prefix, scanID 
 	return removed, nil
 }
 
+func (s *SQLiteStore) ListUnreferencedBlobs(ctx context.Context, bucket string) (blobList []BlobRecord, err error) {
+	const query = `
+	SELECT bucket, blob_key, hash, size 
+	FROM blobs
+	WHERE ref_count = 0 AND bucket = ?
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, bucket)
+	if err != nil {
+		return nil, fmt.Errorf("ListUnreferencedBlobs query error: %w", err)
+	}
+
+	for rows.Next() {
+		var bucket, key, hash string
+		var size int64
+		err := rows.Scan(&bucket, &key, &hash, &size)
+		if err != nil {
+			return nil, fmt.Errorf("ListUnreferencedBlobs rows scan error: %w", err)
+		}
+
+		blobList = append(blobList, BlobRecord{bucket, key, hash, size})
+	}
+
+	return blobList, err
+}
+
+func (s *SQLiteStore) DeleteUnreferencedBlob(
+	ctx context.Context,
+	bucket string,
+	hash string,
+) error {
+	result, err := s.db.ExecContext(ctx, `
+		DELETE FROM blobs
+		WHERE bucket = ? AND hash = ? AND ref_count = 0
+	`, bucket, hash)
+	if err != nil {
+		return fmt.Errorf("delete unreferenced blob %q/%q: %w", bucket, hash, err)
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read deleted blob count: %w", err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("blob %q/%q is missing or referenced again", bucket, hash)
+	}
+	return nil
+}
+
 // Closing store
 func (s *SQLiteStore) Close() error {
 	if err := s.db.Close(); err != nil {

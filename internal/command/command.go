@@ -31,12 +31,7 @@ var scanOnce = &cobra.Command{
 	Short: "Does one lap through S3 storage",
 	Long:  "Reads config file, analyzes S3 storage and forms a report",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx, stop := signal.NotifyContext(
-			cmd.Context(),
-			os.Interrupt,
-			syscall.SIGTERM,
-		)
-		defer stop()
+		ctx := cmd.Context()
 
 		application, err := app.Open(ctx, configPath)
 		if err != nil {
@@ -53,13 +48,7 @@ var runInterval = &cobra.Command{
 	Short: "Scans S3 storage in interval from config",
 	Long:  "Scans S3 storage in interval from config",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx, stop := signal.NotifyContext(
-			cmd.Context(),
-			os.Interrupt,
-			syscall.SIGTERM,
-		)
-		defer stop()
-
+		ctx := cmd.Context()
 		application, err := app.Open(ctx, configPath)
 		if err != nil {
 			return err
@@ -127,7 +116,14 @@ func init() {
 }
 
 func Execute() {
-	if err := rootCmd.Execute(); err != nil {
+	ctx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stop()
+
+	if err := rootCmd.ExecuteContext(ctx); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}

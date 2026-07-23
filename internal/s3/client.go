@@ -2,6 +2,7 @@ package s3
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"s3-dedup/internal/config"
@@ -103,6 +104,59 @@ func (c *Client) PutObject(
 		return 0, fmt.Errorf("PutObject error: %w", err)
 	}
 	return n, nil
+}
+
+func (c *Client) RemoveObjects(
+	ctx context.Context,
+	bucket string,
+	keys []string,
+) ([]string, error) {
+	objectsCh := make(chan string, len(keys))
+	for _, key := range keys {
+		objectsCh <- key
+	}
+	close(objectsCh)
+
+	failed := make(map[string]error)
+	var errs []error
+	batchFailed := false
+
+	for removeErr := range c.S3Client.RemoveObjectsWithContext(
+		ctx,
+		bucket,
+		objectsCh,
+	) {
+		if removeErr.Err == nil {
+			continue
+		}
+
+		err := fmt.Errorf(
+			"remove %q/%q: %w",
+			bucket,
+			removeErr.ObjectName,
+			removeErr.Err,
+		)
+		errs = append(errs, err)
+
+		if removeErr.ObjectName == "" {
+			batchFailed = true
+			continue
+		}
+		failed[removeErr.ObjectName] = removeErr.Err
+	}
+
+	if batchFailed {
+		return nil, errors.Join(errs...)
+	}
+
+	deleted := make([]string, 0, len(keys)-len(failed))
+	for _, key := range keys {
+		if _, exists := failed[key]; !exists {
+			deleted = append(deleted, key)
+		}
+	}
+
+	return deleted, errors.Join(errs...)
 }
 
 func ternary[T any](cond bool, trueVal, falseVal T) T {

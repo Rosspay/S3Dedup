@@ -12,6 +12,8 @@ type Store interface {
 	GetStats(ctx context.Context) (Stats, error)
 	MarkObjectSeen(ctx context.Context, bucket, key, scanID string) error
 	FinalizeScope(ctx context.Context, bucket, prefix, scanID string) (removed int64, err error)
+	ListUnreferencedBlobs(ctx context.Context, bucket string) (blobList []BlobRecord, err error)
+	DeleteUnreferencedBlob(ctx context.Context, bucket string, hash string) error
 	Close() error
 }
 
@@ -26,6 +28,13 @@ type ObjectRecord struct {
 	LastModified time.Time
 	Hash         string
 	LastSeenScan string
+}
+
+type BlobRecord struct {
+	Bucket string
+	Key    string
+	Hash   string
+	Size   int64
 }
 
 type Stats struct {
