@@ -191,10 +191,15 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 		}
 
 	}
-	gcBytes, removedBlobs, err := s.collectGarbage(ctx)
-	if err != nil {
-		scanReport.Errors++
-		return scanReport, fmt.Errorf("garbage collection: %w", err)
+	var gcBytes int64
+	var removedBlobs int64
+	var err error
+	if processErrors.Load() == 0 && scanReport.Errors == 0 {
+		gcBytes, removedBlobs, err = s.collectGarbage(ctx)
+		if err != nil {
+			scanReport.Errors++
+			return scanReport, fmt.Errorf("garbage collection: %w", err)
+		}
 	}
 
 	bytesReclaimed.Add(gcBytes)
@@ -312,7 +317,7 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 	res := statObj
 	relinked := false
 	if s.config.Dedup.DeleteOriginals && !isObjectChanged(statObj, isChanged) {
-		res, err = s.safeDelete(ctx, bucket, info, hash)
+		res, err = s.safeReplace(ctx, bucket, info, hash)
 		if err != nil {
 			return 0, false, fmt.Errorf("processObjectPointer %q/%q: %w", bucket, info.Key, err)
 		}
@@ -358,7 +363,7 @@ func (s *Scanner) processPointer(ctx context.Context, bucket string, info minio.
 	return nil
 }
 
-func (s *Scanner) safeDelete(ctx context.Context, bucket string, info minio.ObjectInfo, hash string) (minio.ObjectInfo, error) {
+func (s *Scanner) safeReplace(ctx context.Context, bucket string, info minio.ObjectInfo, hash string) (minio.ObjectInfo, error) {
 	p := pointer.Pointer{
 		BlobBucket:  bucket,
 		BlobKey:     s.config.Dedup.BlobPrefix + hash,

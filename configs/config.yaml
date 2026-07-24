@@ -13,7 +13,7 @@ dedup:
   hash_algo: "sha256"
   min_size_bytes: 100 #
   blob_prefix: "blobs/"
-  mode: "report_only" # report_only | pointer
+  mode: "pointer" # report_only | pointer
   delete_originals: true # :
 cache:
   backend: "sqlite" # sqlite | leveldb

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/kelseyhightower/envconfig"
 	"gopkg.in/yaml.v2"
@@ -68,27 +69,35 @@ func ConfigParser(filePath string) (*Config, error) {
 		return nil, fmt.Errorf("ConfigParser config path error: %w", err)
 	}
 
-	var config Config
+	var cfg Config
 
 	decoder := yaml.NewDecoder(bytes.NewReader(yamlFile))
 	decoder.SetStrict(true)
 
-	err = decoder.Decode(&config)
+	err = decoder.Decode(&cfg)
 	if err != nil {
 		return nil, fmt.Errorf("ConfigParser: parsing config file error: %w", err)
 	}
 
-	if config.Dedup.Mode != "report_only" && config.Dedup.Mode != "pointer" {
-		return nil, fmt.Errorf("ConfigParser: mode must be either report_only or pointer, got %q", config.Dedup.Mode)
+	if cfg.Dedup.Mode != "report_only" && cfg.Dedup.Mode != "pointer" {
+		return nil, fmt.Errorf("ConfigParser: mode must be either report_only or pointer, got %q", cfg.Dedup.Mode)
 	}
 
-	if config.Cache.Backend != "sqlite" && config.Cache.Backend != "leveldb" {
-		return nil, fmt.Errorf("ConfgiParser: cache backend must be either sqlite or leveldb, got %q", config.Cache.Backend)
+	if cfg.Cache.Backend != "sqlite" && cfg.Cache.Backend != "leveldb" {
+		return nil, fmt.Errorf("ConfgiParser: cache backend must be either sqlite or leveldb, got %q", cfg.Cache.Backend)
 	}
 
-	err = envconfig.Process("", &config)
+	interval, err := time.ParseDuration(cfg.Schedule.ScanInterval)
+	if err != nil {
+		return nil, fmt.Errorf("Parse scan interval: %w", err)
+	}
+	if interval <= 0 {
+		return nil, fmt.Errorf("Scan interval must be > 0")
+	}
+
+	err = envconfig.Process("", &cfg)
 	if err != nil {
 		return nil, fmt.Errorf("ConfgiParser: parsing env variables error: %w", err)
 	}
-	return &config, nil
+	return &cfg, nil
 }

@@ -73,8 +73,8 @@ var runInterval = &cobra.Command{
 
 var reportCommand = &cobra.Command{
 	Use:   "report",
-	Short: "Gets a report from previous scans",
-	Long:  "Gets a report from previous scans",
+	Short: "Gets a report from previous scan",
+	Long:  "Gets a report from previous scan",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 		r, err := report.ReadJSON("report.json")
@@ -119,8 +119,18 @@ func run(ctx context.Context, scan ScanFunc, out string) error {
 }
 
 func runLoop(ctx context.Context, interval time.Duration, scan ScanFunc, out string) error {
+	stopCh := shutdownRequested(ctx)
 	i := 0
 	for {
+		//Checking before scan if shutdown requested, cancelling after first signal
+		select {
+		case <-stopCh:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		fmt.Printf("Scan N%d starts\n", i)
 		if err := run(ctx, scan, out); err != nil {
 			if ctx.Err() != nil {
@@ -129,14 +139,36 @@ func runLoop(ctx context.Context, interval time.Duration, scan ScanFunc, out str
 			fmt.Printf("scan failed: %v\n", err)
 		}
 		i++
+
+		//Checking signal after scan, so there is no timer waiting
+		select {
+		case <-stopCh:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		timer := time.NewTimer(interval)
+
+		//During waiting canceling after first signal
 		select {
 		case <-timer.C:
+		case <-stopCh:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 		case <-ctx.Done():
 			if !timer.Stop() {
-				<-timer.C
+				select {
+				case <-timer.C:
+				default:
+				}
 			}
-			return nil
+			return ctx.Err()
 		}
 	}
 }
@@ -144,11 +176,9 @@ func runLoop(ctx context.Context, interval time.Duration, scan ScanFunc, out str
 func init() {
 	reportPath = "report.json"
 	scanOnce.Flags().StringVarP(&configPath, "config", "c", "", "Config path")
-	scanOnce.Flags().StringVarP(&reportPath, "out", "o", "", "Report path")
 	scanOnce.MarkFlagRequired("config")
 
 	runInterval.Flags().StringVarP(&configPath, "config", "c", "", "Config path")
-	runInterval.Flags().StringVarP(&reportPath, "out", "o", "", "Report path")
 	runInterval.MarkFlagRequired("config")
 
 	reportCommand.Flags().StringVarP(&configPath, "config", "c", "", "Config path")
@@ -159,13 +189,47 @@ func init() {
 	rootCmd.AddCommand(reportCommand)
 }
 
+type shutdownKey struct{}
+
+func shutdownRequested(ctx context.Context) <-chan struct{} {
+	if ch, ok := ctx.Value(shutdownKey{}).(<-chan struct{}); ok {
+		return ch
+	}
+	return ctx.Done()
+}
+
 func Execute() {
-	ctx, stop := signal.NotifyContext(
-		context.Background(),
-		os.Interrupt,
-		syscall.SIGTERM,
+	signals := make(chan os.Signal, 2)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+
+	stopRequested := make(chan struct{})
+	operationCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ctx := context.WithValue(
+		operationCtx,
+		shutdownKey{},
+		(<-chan struct{})(stopRequested),
 	)
-	defer stop()
+
+	go func() {
+		select {
+		case <-signals:
+			fmt.Println("Shutdown requested: finishing current scan")
+			close(stopRequested)
+		case <-operationCtx.Done():
+			return
+		}
+
+		select {
+		case <-signals:
+			fmt.Println("Forced shutdown: cancelling current operation")
+			close(stopRequested)
+		case <-operationCtx.Done():
+			return
+		}
+	}()
 
 	if err := rootCmd.ExecuteContext(ctx); err != nil {
 		fmt.Println(err)
