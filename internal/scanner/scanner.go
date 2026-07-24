@@ -104,7 +104,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 		scanReport.ObjectsScanned = objectsScanned.Load()
 		scanReport.Errors += processErrors.Load()
 		scanReport.ObjectsRelinked = objectsRelinked.Load()
-		scanReport.BytesReclaimed += bytesReclaimed.Load()
+		scanReport.BytesReclaimed = bytesReclaimed.Load()
 	}()
 
 	for _, bucket := range s.config.S3.Buckets {
@@ -197,7 +197,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 		return scanReport, fmt.Errorf("garbage collection: %w", err)
 	}
 
-	scanReport.BytesReclaimed += gcBytes
+	bytesReclaimed.Add(gcBytes)
 	fmt.Printf("Blobs removed: %d, bytes reclaimed: %d\n", removedBlobs, gcBytes)
 	stats, err := s.store.GetStats(ctx)
 	if err != nil {
@@ -206,7 +206,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 	}
 	scanReport.UniqueBlobs = stats.UniqueBlobs
 	scanReport.DuplicatesFound = stats.DuplicatesFound
-	scanReport.BytesReclaimable = stats.BytesReclaimable
+	scanReport.BytesReclaimable = stats.BytesReclaimable + gcBytes
 
 	return scanReport, nil
 }
@@ -216,6 +216,14 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 // (not at the end of the whole scan), keeping open connections bounded.
 func (s *Scanner) processObject(ctx context.Context, bucket string,
 	info minio.ObjectInfo, scanID string) error {
+	statObj, err := s.s3Client.StatObject(ctx, bucket, info.Key)
+	if err != nil {
+		return err
+	}
+	if statObj.ContentType == pointer.ContentPointerType {
+		return s.processPointer(ctx, bucket, info, scanID)
+	}
+
 	obj, err := s.s3Client.GetObject(ctx, bucket, info.Key)
 	if err != nil {
 		return err

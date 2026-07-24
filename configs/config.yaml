@@ -13,14 +13,14 @@ dedup:
   hash_algo: "sha256"
   min_size_bytes: 100 #
   blob_prefix: "blobs/"
-  mode: "pointer" # report_only | pointer
+  mode: "report_only" # report_only | pointer
   delete_originals: true # :
 cache:
   backend: "sqlite" # sqlite | leveldb
   path: "D:\\S3Dedup\\cmd\\s3-dedup\\state.db"
 schedule:
   scan_interval: "20s" #
-  workers: 8 #
+  workers: 1 #
 logging:
   level: "info"
   file: "/var/log/s3-dedup/service.log"
