@@ -2,7 +2,7 @@ package config
 
 import (
 	"bytes"
-	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -65,7 +65,7 @@ func ConfigParser(filePath string) (*Config, error) {
 	yamlFile, err := os.ReadFile(filename)
 
 	if err != nil {
-		return nil, errors.New("Config path error: No such file")
+		return nil, fmt.Errorf("ConfigParser config path error: %w", err)
 	}
 
 	var config Config
@@ -75,12 +75,20 @@ func ConfigParser(filePath string) (*Config, error) {
 
 	err = decoder.Decode(&config)
 	if err != nil {
-		return nil, errors.New("Parsing config file error: Wrong config structure")
+		return nil, fmt.Errorf("ConfigParser: parsing config file error: %w", err)
+	}
+
+	if config.Dedup.Mode != "report_only" && config.Dedup.Mode != "pointer" {
+		return nil, fmt.Errorf("ConfigParser: mode must be either report_only or pointer, got %q", config.Dedup.Mode)
+	}
+
+	if config.Cache.Backend != "sqlite" && config.Cache.Backend != "leveldb" {
+		return nil, fmt.Errorf("ConfgiParser: cache backend must be either sqlite or leveldb, got %q", config.Cache.Backend)
 	}
 
 	err = envconfig.Process("", &config)
 	if err != nil {
-		return nil, errors.New("Parsing env variables error")
+		return nil, fmt.Errorf("ConfgiParser: parsing env variables error: %w", err)
 	}
 	return &config, nil
 }

@@ -66,7 +66,7 @@ func TestEnvVarReading(t *testing.T) {
 // Testing error handling for passing wrong path
 func TestErrorNoSuchFile(t *testing.T) {
 	resultConfig, err := ConfigParser("./no_such_file.yaml")
-	if resultConfig != nil || err.Error() != "Config path error: No such file" {
+	if resultConfig != nil || err == nil {
 		t.Error("Error handling with passing wrong file failed")
 	}
 }
@@ -74,7 +74,7 @@ func TestErrorNoSuchFile(t *testing.T) {
 // Testing error handling for passing wrong config structure
 func TestWrongFileStructure(t *testing.T) {
 	resultConfig, err := ConfigParser("./wrong_structure.yaml")
-	if resultConfig != nil || err.Error() != "Parsing config file error: Wrong config structure" {
+	if resultConfig != nil || err == nil {
 		t.Error("Error handling with passing a config with a wrong structure failed")
 	}
 }

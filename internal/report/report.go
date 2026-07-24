@@ -1,6 +1,7 @@
 package report
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -46,4 +47,23 @@ func WriteJSON(path string, report Report) error {
 		return fmt.Errorf("Error encoding to json: %v", err)
 	}
 	return nil
+}
+
+func ReadJSON(path string) (Report, error) {
+	var report Report
+	filename, _ := filepath.Abs(path)
+	jsonFile, err := os.ReadFile(filename)
+
+	if err != nil {
+		return Report{}, fmt.Errorf("Report path error: %w", err)
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(jsonFile))
+	decoder.DisallowUnknownFields()
+	err = decoder.Decode(&report)
+	if err != nil {
+		return Report{}, fmt.Errorf("Report structure error: %w", err)
+	}
+
+	return report, nil
 }

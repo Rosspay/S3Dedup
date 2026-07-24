@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"s3-dedup/internal/app"
+	"s3-dedup/internal/cache"
+	"s3-dedup/internal/config"
 	"s3-dedup/internal/report"
 
 	"github.com/spf13/cobra"
@@ -69,12 +71,47 @@ var runInterval = &cobra.Command{
 	},
 }
 
+var reportCommand = &cobra.Command{
+	Use:   "report",
+	Short: "Gets a report from previous scans",
+	Long:  "Gets a report from previous scans",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+		r, err := report.ReadJSON("report.json")
+		if err != nil {
+			return fmt.Errorf("ReadJSON error: %w", err)
+		}
+
+		cfg, err := config.ConfigParser(configPath)
+		if err != nil {
+			return fmt.Errorf("load config: %w", err)
+		}
+
+		store, err := cache.OpenSQLite(cfg.Cache.Path)
+		if err != nil {
+			return fmt.Errorf("open cache: %w", err)
+		}
+		defer store.Close()
+
+		stats, err := store.GetStats(ctx)
+		r.UniqueBlobs = stats.UniqueBlobs
+		r.DuplicatesFound = stats.DuplicatesFound
+		r.BytesReclaimable = stats.BytesReclaimable
+
+		err = report.WriteJSON(reportPath, r)
+		if err != nil {
+			return fmt.Errorf("WriteJSON error: %w", err)
+		}
+		fmt.Printf("%+v", r)
+		return nil
+	},
+}
+
 func run(ctx context.Context, scan ScanFunc, out string) error {
 	scanReport, scanErr := scan(ctx)
 
 	var writeErr error
 	if out != "" {
-		//scanReport.ScanFinished = time.Now().UTC()
 		fmt.Printf("%+v\n", scanReport)
 		writeErr = report.WriteJSON(out, scanReport)
 	}
@@ -105,14 +142,21 @@ func runLoop(ctx context.Context, interval time.Duration, scan ScanFunc, out str
 }
 
 func init() {
+	reportPath = "report.json"
 	scanOnce.Flags().StringVarP(&configPath, "config", "c", "", "Config path")
-	scanOnce.MarkFlagRequired("config")
 	scanOnce.Flags().StringVarP(&reportPath, "out", "o", "", "Report path")
+	scanOnce.MarkFlagRequired("config")
+
 	runInterval.Flags().StringVarP(&configPath, "config", "c", "", "Config path")
-	runInterval.MarkFlagRequired("config")
 	runInterval.Flags().StringVarP(&reportPath, "out", "o", "", "Report path")
+	runInterval.MarkFlagRequired("config")
+
+	reportCommand.Flags().StringVarP(&configPath, "config", "c", "", "Config path")
+	reportCommand.Flags().StringVarP(&reportPath, "out", "o", "", "Report path")
+	reportCommand.MarkFlagRequired("out")
 	rootCmd.AddCommand(scanOnce)
 	rootCmd.AddCommand(runInterval)
+	rootCmd.AddCommand(reportCommand)
 }
 
 func Execute() {
