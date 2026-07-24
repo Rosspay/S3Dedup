@@ -13,6 +13,7 @@ import (
 	"s3-dedup/internal/pointer"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 // Mocking S3 client for testing purposes
 // so we can simulate basic behavior and errors
 type MockS3Client struct {
+	mu         sync.RWMutex
 	objects    []minio.ObjectInfo
 	contents   map[string]string
 	stats      map[string]minio.ObjectInfo
@@ -41,10 +43,15 @@ func (m *MockS3Client) ListObjects(
 	recursive bool,
 	fn func(minio.ObjectInfo) error,
 ) error {
-	if m.listErr != nil {
-		return m.listErr
+	m.mu.RLock()
+	listErr := m.listErr
+	objects := append([]minio.ObjectInfo(nil), m.objects...)
+	m.mu.RUnlock()
+
+	if listErr != nil {
+		return listErr
 	}
-	for _, object := range m.objects {
+	for _, object := range objects {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -74,6 +81,8 @@ func (m *MockS3Client) GetObject(
 	}
 
 	id := objectID(bucket, key)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if err := m.errors[id]; err != nil {
 		return nil, err
 	}
@@ -99,11 +108,14 @@ func (m *MockS3Client) PutObject(
 	}
 
 	id := objectID(bucket, objectName)
+	m.mu.Lock()
 	if m.putCalls == nil {
 		m.putCalls = make(map[string]int)
 	}
 	m.putCalls[id]++
-	if putErr := m.putErrors[id]; putErr != nil {
+	putErr := m.putErrors[id]
+	m.mu.Unlock()
+	if putErr != nil {
 		return 0, putErr
 	}
 
@@ -115,6 +127,8 @@ func (m *MockS3Client) PutObject(
 		return 0, fmt.Errorf("put object %q/%q: read %d bytes, expected %d", bucket, objectName, len(data), size)
 	}
 
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.contents == nil {
 		m.contents = make(map[string]string)
 	}
@@ -152,6 +166,8 @@ func (m *MockS3Client) StatObject(
 	}
 
 	id := objectID(bucket, objectName)
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.statCalls == nil {
 		m.statCalls = make(map[string]int)
 	}
@@ -499,22 +515,52 @@ func TestPointerModeRepeatedScanDoesNotUploadBlobAgain(t *testing.T) {
 		},
 	}
 	cfg := pointerTestConfig()
+	cfg.Dedup.DeleteOriginals = true
 	scanner := NewScanner(client, store, cfg)
 
-	if _, err := scanner.ScanOnce(context.Background()); err != nil {
+	firstResult, err := scanner.ScanOnce(context.Background())
+	if err != nil {
 		t.Fatalf("first ScanOnce error: %v", err)
 	}
 	blobKey := cfg.Dedup.BlobPrefix + hashContent(t, content)
-	firstPutCalls := client.putCallCount("bucket", blobKey)
+	firstBlobPutCalls := client.putCallCount("bucket", blobKey)
+	firstTotalPutCalls := client.totalPutCalls()
+	firstStats, err := store.GetStats(context.Background())
+	if err != nil {
+		t.Fatalf("GetStats after first scan: %v", err)
+	}
 
-	if _, err := scanner.ScanOnce(context.Background()); err != nil {
+	secondResult, err := scanner.ScanOnce(context.Background())
+	if err != nil {
 		t.Fatalf("second ScanOnce error: %v", err)
 	}
-	if got := client.putCallCount("bucket", blobKey); got != firstPutCalls {
-		t.Errorf("PutObject calls after repeated scan = %d, expected %d", got, firstPutCalls)
+	secondStats, err := store.GetStats(context.Background())
+	if err != nil {
+		t.Fatalf("GetStats after second scan: %v", err)
 	}
-	if firstPutCalls != 1 {
-		t.Errorf("PutObject calls after first scan = %d, expected 1", firstPutCalls)
+
+	if firstBlobPutCalls != 1 {
+		t.Errorf("blob PutObject calls after first scan = %d, expected 1", firstBlobPutCalls)
+	}
+	if got := client.putCallCount("bucket", blobKey); got != firstBlobPutCalls {
+		t.Errorf("blob PutObject calls after repeated scan = %d, expected %d", got, firstBlobPutCalls)
+	}
+	if got := client.totalPutCalls(); got != firstTotalPutCalls {
+		t.Errorf("total PutObject calls after repeated scan = %d, expected %d", got, firstTotalPutCalls)
+	}
+	if secondResult.ObjectsRelinked != 0 {
+		t.Errorf("second ObjectsRelinked = %d, expected 0", secondResult.ObjectsRelinked)
+	}
+	if secondResult.BytesReclaimed != 0 {
+		t.Errorf("second BytesReclaimed = %d, expected 0", secondResult.BytesReclaimed)
+	}
+	if secondResult.UniqueBlobs != firstResult.UniqueBlobs ||
+		secondResult.DuplicatesFound != firstResult.DuplicatesFound ||
+		secondResult.BytesReclaimable != firstResult.BytesReclaimable {
+		t.Errorf("second report stats = %+v, expected first report stats %+v", secondResult, firstResult)
+	}
+	if secondStats != firstStats {
+		t.Errorf("cache stats after second scan = %+v, expected %+v", secondStats, firstStats)
 	}
 }
 
@@ -760,6 +806,13 @@ func TestPointerModeChangedObjectAfterListingIsNotReplaced(t *testing.T) {
 	if result.BytesReclaimed != 0 {
 		t.Errorf("BytesReclaimed = %d, expected 0", result.BytesReclaimed)
 	}
+	stats, err := store.GetStats(context.Background())
+	if err != nil {
+		t.Fatalf("GetStats error: %v", err)
+	}
+	if stats.UniqueBlobs != 0 || stats.DuplicatesFound != 0 || stats.BytesReclaimable != 0 {
+		t.Errorf("changed object was registered with stale metadata: %+v", stats)
+	}
 }
 
 func TestPointerModePointerWriteErrorDoesNotRegisterReference(t *testing.T) {
@@ -806,6 +859,77 @@ func TestPointerModePointerWriteErrorDoesNotRegisterReference(t *testing.T) {
 	}
 	if stats.UniqueBlobs != 0 || stats.DuplicatesFound != 0 || stats.BytesReclaimable != 0 {
 		t.Errorf("cache was changed after failed pointer upload: %+v", stats)
+	}
+}
+
+func TestPointerModeCreatedBlobSurvivesPointerWriteFailureAndIsReused(t *testing.T) {
+	const key = "original.txt"
+	const content = "blob must be reused after pointer failure"
+
+	store := openTestStore(t)
+	cfg := pointerTestConfig()
+	cfg.Dedup.DeleteOriginals = true
+	hash := hashContent(t, content)
+	blobKey := cfg.Dedup.BlobPrefix + hash
+	pointerID := objectID("bucket", key)
+	client := &MockS3Client{
+		objects: []minio.ObjectInfo{objectInfo(key, int64(len(content)))},
+		contents: map[string]string{
+			pointerID: content,
+		},
+		putErrors: map[string]error{
+			pointerID: errors.New("simulated pointer upload error"),
+		},
+	}
+	scanner := NewScanner(client, store, cfg)
+
+	firstResult, err := scanner.ScanOnce(context.Background())
+	if err != nil {
+		t.Fatalf("first ScanOnce error: %v", err)
+	}
+	if firstResult.Errors != 1 {
+		t.Errorf("first Errors = %d, expected 1", firstResult.Errors)
+	}
+	if got := client.content(pointerID); got != content {
+		t.Errorf("original content after pointer failure = %q, expected %q", got, content)
+	}
+	if got := client.content(objectID("bucket", blobKey)); got != content {
+		t.Errorf("created blob content = %q, expected %q", got, content)
+	}
+	if got := client.putCallCount("bucket", blobKey); got != 1 {
+		t.Errorf("blob PutObject calls after first scan = %d, expected 1", got)
+	}
+	stats, err := store.GetStats(context.Background())
+	if err != nil {
+		t.Fatalf("GetStats after failed scan: %v", err)
+	}
+	if stats.UniqueBlobs != 0 || stats.DuplicatesFound != 0 || stats.BytesReclaimable != 0 {
+		t.Errorf("cache changed after pointer failure: %+v", stats)
+	}
+
+	delete(client.putErrors, pointerID)
+	secondResult, err := scanner.ScanOnce(context.Background())
+	if err != nil {
+		t.Fatalf("second ScanOnce error: %v", err)
+	}
+	if secondResult.Errors != 0 {
+		t.Errorf("second Errors = %d, expected 0", secondResult.Errors)
+	}
+	if secondResult.ObjectsRelinked != 1 {
+		t.Errorf("second ObjectsRelinked = %d, expected 1", secondResult.ObjectsRelinked)
+	}
+	if got := client.putCallCount("bucket", blobKey); got != 1 {
+		t.Errorf("blob was uploaded again: PutObject calls = %d, expected 1", got)
+	}
+	if got := client.stats[pointerID].ContentType; got != pointer.ContentPointerType {
+		t.Errorf("object ContentType after retry = %q, expected %q", got, pointer.ContentPointerType)
+	}
+	stats, err = store.GetStats(context.Background())
+	if err != nil {
+		t.Fatalf("GetStats after retry: %v", err)
+	}
+	if stats.UniqueBlobs != 1 || stats.DuplicatesFound != 0 {
+		t.Errorf("cache was not restored after retry: %+v", stats)
 	}
 }
 
@@ -1118,14 +1242,20 @@ func withContentType(info minio.ObjectInfo, contentType string) minio.ObjectInfo
 }
 
 func (m *MockS3Client) content(id string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.contents[id]
 }
 
 func (m *MockS3Client) putCallCount(bucket, key string) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.putCalls[objectID(bucket, key)]
 }
 
 func (m *MockS3Client) totalPutCalls() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	var total int
 	for _, calls := range m.putCalls {
 		total += calls
@@ -1134,6 +1264,8 @@ func (m *MockS3Client) totalPutCalls() int {
 }
 
 func (m *MockS3Client) countObjectsWithPrefix(bucket, prefix string) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	idPrefix := objectID(bucket, prefix)
 	var count int
 	for id := range m.contents {

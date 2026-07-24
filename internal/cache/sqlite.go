@@ -231,7 +231,7 @@ func (s *SQLiteStore) IsObjectUnchanged(
 	`
 
 	var found int
-	err := s.db.QueryRowContext(ctx, query, bucket, key, etag, size, lastModified).Scan(&found)
+	err := s.db.QueryRowContext(ctx, query, bucket, key, etag, size, lastModified.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")).Scan(&found)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return false, nil
@@ -243,6 +243,12 @@ func (s *SQLiteStore) IsObjectUnchanged(
 
 func validateObject(object ObjectRecord) error {
 	switch {
+	case object.BlobBucket == "":
+		return fmt.Errorf("register object: blob bucket is empty")
+	case object.BlobKey == "":
+		return fmt.Errorf("register object: blob key is empty")
+	case object.BlobSize < 0:
+		return fmt.Errorf("register object %q/%q: size is negative", object.Bucket, object.Key)
 	case object.Bucket == "":
 		return fmt.Errorf("register object: bucket is empty")
 	case object.Key == "":

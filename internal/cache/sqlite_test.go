@@ -11,7 +11,7 @@ func TestRegisteringFirstObject(t *testing.T) {
 	store := openTestStore(t)
 	register(t, store, record("bucket", "one.txt", "hash", 100))
 
-	assertRefCount(t, store, "hash", 1)
+	assertRefCount(t, store, "bucket", "hash", 1)
 	assertStats(t, store, Stats{UniqueBlobs: 1})
 }
 
@@ -20,7 +20,7 @@ func TestRegisterObjectDuplicate(t *testing.T) {
 	register(t, store, record("bucket", "one.txt", "sameHash", 100))
 	register(t, store, record("bucket", "two.txt", "sameHash", 100))
 
-	assertRefCount(t, store, "sameHash", 2)
+	assertRefCount(t, store, "bucket", "sameHash", 2)
 	assertStats(t, store, Stats{
 		UniqueBlobs:      1,
 		DuplicatesFound:  1,
@@ -33,8 +33,8 @@ func TestRegisterObjectDifferent(t *testing.T) {
 	register(t, store, record("bucket", "one.txt", "hash", 100))
 	register(t, store, record("bucket", "two.txt", "diffHash", 125))
 
-	assertRefCount(t, store, "hash", 1)
-	assertRefCount(t, store, "diffHash", 1)
+	assertRefCount(t, store, "bucket", "hash", 1)
+	assertRefCount(t, store, "bucket", "diffHash", 1)
 
 	assertStats(t, store, Stats{UniqueBlobs: 2})
 }
@@ -48,7 +48,7 @@ func TestRegisterObjectRepeatedPassIsIdempotent(t *testing.T) {
 	object.LastSeenScan = "scan-2"
 	register(t, store, object)
 
-	assertRefCount(t, store, "hash", 1)
+	assertRefCount(t, store, "bucket", "hash", 1)
 	assertStats(t, store, Stats{UniqueBlobs: 1})
 }
 
@@ -57,8 +57,8 @@ func TestRegisterObjectContentChanged(t *testing.T) {
 	register(t, store, record("bucket", "one.txt", "hash", 100))
 	register(t, store, record("bucket", "one.txt", "newHash", 200))
 
-	assertRefCount(t, store, "hash", 0)
-	assertRefCount(t, store, "newHash", 1)
+	assertRefCount(t, store, "bucket", "hash", 0)
+	assertRefCount(t, store, "bucket", "newHash", 1)
 	assertStats(t, store, Stats{UniqueBlobs: 1})
 }
 
@@ -68,7 +68,7 @@ func TestRegisterObjectMoreDupes(t *testing.T) {
 	register(t, store, record("bucket", "two.txt", "sameHash", 100))
 	register(t, store, record("bucket", "three.txt", "sameHash", 100))
 
-	assertRefCount(t, store, "sameHash", 3)
+	assertRefCount(t, store, "bucket", "sameHash", 3)
 	assertStats(t, store, Stats{
 		UniqueBlobs:      1,
 		DuplicatesFound:  2,
@@ -76,17 +76,14 @@ func TestRegisterObjectMoreDupes(t *testing.T) {
 	})
 }
 
-func TestRegisterObjectDupesDiffBuckets(t *testing.T) {
+func TestRegisterObjectSameHashDifferentBlobBuckets(t *testing.T) {
 	store := openTestStore(t)
 	register(t, store, record("bucket", "one.txt", "hash", 100))
 	register(t, store, record("diffBucket", "one.txt", "hash", 100))
 
-	assertRefCount(t, store, "hash", 2)
-	assertStats(t, store, Stats{
-		UniqueBlobs:      1,
-		DuplicatesFound:  1,
-		BytesReclaimable: 100,
-	})
+	assertRefCount(t, store, "bucket", "hash", 1)
+	assertRefCount(t, store, "diffBucket", "hash", 1)
+	assertStats(t, store, Stats{UniqueBlobs: 2})
 }
 
 func TestOpenSQLiteErrors(t *testing.T) {
@@ -111,7 +108,7 @@ func TestFinalizeScopeObjectIsNotDiscoveredSameHash(t *testing.T) {
 	if removed != 1 {
 		t.Fatalf("Object was not removed during scope finalize")
 	}
-	assertRefCount(t, store, "hash", 1)
+	assertRefCount(t, store, "bucket", "hash", 1)
 	assertStats(t, store, Stats{
 		UniqueBlobs:      1,
 		DuplicatesFound:  0,
@@ -134,8 +131,8 @@ func TestFinalizeScopeObjectIsNotDiscoveredDiffHash(t *testing.T) {
 	if removed != 1 {
 		t.Fatalf("Object was not removed during scope finalize")
 	}
-	assertRefCount(t, store, "hash", 1)
-	assertRefCount(t, store, "diffHash", 0)
+	assertRefCount(t, store, "bucket", "hash", 1)
+	assertRefCount(t, store, "bucket", "diffHash", 0)
 	assertStats(t, store, Stats{
 		UniqueBlobs:      1,
 		DuplicatesFound:  0,
@@ -154,7 +151,7 @@ func TestFinalizeScopeIsIdempotent(t *testing.T) {
 	if removed != 0 {
 		t.Fatalf("Object shouldn't be removed")
 	}
-	assertRefCount(t, store, "hash", 2)
+	assertRefCount(t, store, "bucket", "hash", 2)
 	assertStats(t, store, Stats{
 		UniqueBlobs:      1,
 		DuplicatesFound:  1,
@@ -167,7 +164,7 @@ func TestFinalizeScopeIsIdempotent(t *testing.T) {
 	if removed != 0 {
 		t.Fatalf("Object shouldn't be removed")
 	}
-	assertRefCount(t, store, "hash", 2)
+	assertRefCount(t, store, "bucket", "hash", 2)
 	assertStats(t, store, Stats{
 		UniqueBlobs:      1,
 		DuplicatesFound:  1,
@@ -190,7 +187,7 @@ func TestFinalizeScopeDoesNotAffectDiffPrefix(t *testing.T) {
 	if removed == 2 {
 		t.Fatalf("Finalize scope affected different prefix")
 	}
-	assertRefCount(t, store, "hash", 1)
+	assertRefCount(t, store, "bucket", "hash", 1)
 	assertStats(t, store, Stats{
 		UniqueBlobs:      1,
 		DuplicatesFound:  0,
@@ -223,23 +220,30 @@ func register(t *testing.T, store *SQLiteStore, object ObjectRecord) {
 func record(bucket, key, hash string, size int64) ObjectRecord {
 	return ObjectRecord{
 		Bucket:       bucket,
+		BlobBucket:   bucket,
+		BlobKey:      "blobs/" + hash,
 		Key:          key,
 		ETag:         "etag",
 		Size:         size,
+		BlobSize:     size,
 		LastModified: time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC),
 		Hash:         hash,
 		LastSeenScan: "scan-1",
 	}
 }
 
-func assertRefCount(t *testing.T, store *SQLiteStore, hash string, expected int64) {
+func assertRefCount(t *testing.T, store *SQLiteStore, bucket, hash string, expected int64) {
 	t.Helper()
 	var got int64
-	if err := store.db.QueryRow(`SELECT ref_count FROM blobs WHERE hash = ?`, hash).Scan(&got); err != nil {
-		t.Fatalf("Reading ref_count for hash %q: %v", hash, err)
+	if err := store.db.QueryRow(`
+		SELECT ref_count
+		FROM blobs
+		WHERE bucket = ? AND hash = ?
+	`, bucket, hash).Scan(&got); err != nil {
+		t.Fatalf("read refcount for %q/%q: %v", bucket, hash, err)
 	}
 	if got != expected {
-		t.Errorf("Ref_count for hash %q = %d, expected %d", hash, got, expected)
+		t.Errorf("refcount for %q/%q = %d, expected %d", bucket, hash, got, expected)
 	}
 }
 

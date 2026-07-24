@@ -194,7 +194,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 	var gcBytes int64
 	var removedBlobs int64
 	var err error
-	if processErrors.Load() == 0 && scanReport.Errors == 0 {
+	if processErrors.Load() == 0 && scanReport.Errors == 0 && s.config.Dedup.Mode == "pointer" {
 		gcBytes, removedBlobs, err = s.collectGarbage(ctx)
 		if err != nil {
 			scanReport.Errors++
@@ -316,7 +316,8 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 
 	res := statObj
 	relinked := false
-	if s.config.Dedup.DeleteOriginals && !isObjectChanged(statObj, isChanged) {
+	flagChanged := isObjectChanged(statObj, isChanged)
+	if s.config.Dedup.DeleteOriginals && !flagChanged {
 		res, err = s.safeReplace(ctx, bucket, info, hash)
 		if err != nil {
 			return 0, false, fmt.Errorf("processObjectPointer %q/%q: %w", bucket, info.Key, err)
@@ -324,11 +325,12 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 		relinked = true
 	}
 
-	err = s.register(ctx, bucket, bucket, blobKey, res, hash, info.Size, scanID)
-	if err != nil {
-		return 0, false, err
+	if !flagChanged {
+		err = s.register(ctx, bucket, bucket, blobKey, res, hash, info.Size, scanID)
+		if err != nil {
+			return 0, false, err
+		}
 	}
-
 	return info.Size - res.Size + reclaimed, relinked, nil
 }
 
@@ -381,10 +383,13 @@ func (s *Scanner) safeReplace(ctx context.Context, bucket string, info minio.Obj
 		return minio.ObjectInfo{}, fmt.Errorf("safeDelete %q/%q: %w", bucket, info.Key, err)
 	}
 	if n != int64(len(data)) {
-		return minio.ObjectInfo{}, fmt.Errorf("safeDelete %q/%q: %w", bucket, info.Key, err)
+		return minio.ObjectInfo{}, fmt.Errorf("safeDelete %q/%q: PutObject size mismatch", bucket, info.Key)
 	}
 
 	obj, err := s.s3Client.StatObject(ctx, bucket, info.Key)
+	if err != nil {
+		return minio.ObjectInfo{}, fmt.Errorf("safeDelete %q/%q: %w", bucket, info.Key, err)
+	}
 	if obj.Size != int64(len(data)) {
 		return minio.ObjectInfo{}, fmt.Errorf("safeDelete %q/%q: object put has different size", bucket, info.Key)
 	}

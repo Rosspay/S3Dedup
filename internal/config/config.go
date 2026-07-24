@@ -83,8 +83,8 @@ func ConfigParser(filePath string) (*Config, error) {
 		return nil, fmt.Errorf("ConfigParser: mode must be either report_only or pointer, got %q", cfg.Dedup.Mode)
 	}
 
-	if cfg.Cache.Backend != "sqlite" && cfg.Cache.Backend != "leveldb" {
-		return nil, fmt.Errorf("ConfgiParser: cache backend must be either sqlite or leveldb, got %q", cfg.Cache.Backend)
+	if cfg.Cache.Backend != "sqlite" {
+		return nil, fmt.Errorf("ConfgiParser: cache backend must be sqlite, got %q", cfg.Cache.Backend)
 	}
 
 	interval, err := time.ParseDuration(cfg.Schedule.ScanInterval)

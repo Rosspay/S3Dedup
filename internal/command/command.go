@@ -10,8 +10,6 @@ import (
 	"time"
 
 	"s3-dedup/internal/app"
-	"s3-dedup/internal/cache"
-	"s3-dedup/internal/config"
 	"s3-dedup/internal/report"
 
 	"github.com/spf13/cobra"
@@ -76,28 +74,10 @@ var reportCommand = &cobra.Command{
 	Short: "Gets a report from previous scan",
 	Long:  "Gets a report from previous scan",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx := cmd.Context()
 		r, err := report.ReadJSON("report.json")
 		if err != nil {
 			return fmt.Errorf("ReadJSON error: %w", err)
 		}
-
-		cfg, err := config.ConfigParser(configPath)
-		if err != nil {
-			return fmt.Errorf("load config: %w", err)
-		}
-
-		store, err := cache.OpenSQLite(cfg.Cache.Path)
-		if err != nil {
-			return fmt.Errorf("open cache: %w", err)
-		}
-		defer store.Close()
-
-		stats, err := store.GetStats(ctx)
-		r.UniqueBlobs = stats.UniqueBlobs
-		r.DuplicatesFound = stats.DuplicatesFound
-		r.BytesReclaimable = stats.BytesReclaimable
-
 		err = report.WriteJSON(reportPath, r)
 		if err != nil {
 			return fmt.Errorf("WriteJSON error: %w", err)
@@ -181,7 +161,6 @@ func init() {
 	runInterval.Flags().StringVarP(&configPath, "config", "c", "", "Config path")
 	runInterval.MarkFlagRequired("config")
 
-	reportCommand.Flags().StringVarP(&configPath, "config", "c", "", "Config path")
 	reportCommand.Flags().StringVarP(&reportPath, "out", "o", "", "Report path")
 	reportCommand.MarkFlagRequired("out")
 	rootCmd.AddCommand(scanOnce)
@@ -225,7 +204,7 @@ func Execute() {
 		select {
 		case <-signals:
 			fmt.Println("Forced shutdown: cancelling current operation")
-			close(stopRequested)
+			cancel()
 		case <-operationCtx.Done():
 			return
 		}
