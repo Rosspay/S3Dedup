@@ -51,7 +51,7 @@ func TestPointerModePointerSurvivesCacheFailureAndRestoresReference(t *testing.T
 		err:       errors.New("simulated cache commit error"),
 	}
 
-	firstResult, err := NewScanner(client, failingStore, cfg).ScanOnce(ctx)
+	firstResult, err := newTestScanner(t, client, failingStore, cfg).ScanOnce(ctx)
 	if err != nil {
 		t.Fatalf("first ScanOnce error: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestPointerModePointerSurvivesCacheFailureAndRestoresReference(t *testing.T
 		t.Errorf("cache changed despite RegisterObject failure: %+v", stats)
 	}
 
-	secondResult, err := NewScanner(client, store, cfg).ScanOnce(ctx)
+	secondResult, err := newTestScanner(t, client, store, cfg).ScanOnce(ctx)
 	if err != nil {
 		t.Fatalf("second ScanOnce error: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestCollectGarbageKeepsFailedBlobAndDeletesSuccessfulBlob(t *testing.T) {
 		{Name: secondBucket},
 	}
 
-	bytesReclaimed, blobsRemoved, err := NewScanner(client, store, cfg).collectGarbage(ctx)
+	bytesReclaimed, blobsRemoved, err := newTestScanner(t, client, store, cfg).collectGarbage(ctx)
 	if err == nil {
 		t.Fatal("collectGarbage error = nil, expected partial deletion error")
 	}
@@ -210,7 +210,7 @@ func TestScanOnceCancellationDuringListingDoesNotFinalizeOrCollectGarbage(t *tes
 		},
 	}
 
-	result, err := NewScanner(client, store, testConfig()).ScanOnce(ctx)
+	result, err := newTestScanner(t, client, store, testConfig()).ScanOnce(ctx)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("ScanOnce error = %v, expected context.Canceled", err)
 	}
@@ -255,7 +255,7 @@ func TestScanOnceListObjectsErrorNoFinalize(t *testing.T) {
 		errors:   make(map[string]error),
 	}
 
-	scanner := NewScanner(client, store, testConfig())
+	scanner := newTestScanner(t, client, store, testConfig())
 	res, resErr := scanner.ScanOnce(context.Background())
 	if !errors.Is(resErr, listErr) {
 		t.Fatalf("ScanOnce error = %v, expected %v", resErr, listErr)
@@ -293,7 +293,7 @@ func TestScanOnceMarkObjectSeen(t *testing.T) {
 		},
 	}
 
-	scanner := NewScanner(client, store, testConfig())
+	scanner := newTestScanner(t, client, store, testConfig())
 	res, err := scanner.ScanOnce(context.Background())
 	if err != nil {
 		t.Fatalf("ScanOnce error: %v", err)
@@ -341,7 +341,7 @@ func TestScanOnceNoObjectLostWithError(t *testing.T) {
 
 	config := testConfig()
 	config.Schedule.Workers = 8
-	scanner := NewScanner(client, store, config)
+	scanner := newTestScanner(t, client, store, config)
 	res, err := scanner.ScanOnce(context.Background())
 	if err != nil {
 		t.Fatalf("ScanOnce error: %v", err)
@@ -377,7 +377,7 @@ func TestPointerModeUploadErrorKeepsOriginalAndDoesNotRegister(t *testing.T) {
 		},
 	}
 
-	result, err := NewScanner(client, store, cfg).ScanOnce(context.Background())
+	result, err := newTestScanner(t, client, store, cfg).ScanOnce(context.Background())
 	if err != nil {
 		t.Fatalf("ScanOnce error: %v", err)
 	}
@@ -421,7 +421,7 @@ func TestPointerModeExistingPointersRestoreCacheWithoutCreatingBlob(t *testing.T
 	}
 	cfg := pointerTestConfig()
 
-	result, err := NewScanner(client, store, cfg).ScanOnce(context.Background())
+	result, err := newTestScanner(t, client, store, cfg).ScanOnce(context.Background())
 	if err != nil {
 		t.Fatalf("ScanOnce error: %v", err)
 	}
@@ -480,7 +480,7 @@ func TestPointerModeChangedObjectAfterListingIsNotReplaced(t *testing.T) {
 	cfg := pointerTestConfig()
 	cfg.Dedup.DeleteOriginals = true
 
-	result, err := NewScanner(client, store, cfg).ScanOnce(context.Background())
+	result, err := newTestScanner(t, client, store, cfg).ScanOnce(context.Background())
 	if err != nil {
 		t.Fatalf("ScanOnce error: %v", err)
 	}
@@ -523,7 +523,7 @@ func TestPointerModeCreatedBlobSurvivesPointerWriteFailureAndIsReused(t *testing
 			pointerID: errors.New("simulated pointer upload error"),
 		},
 	}
-	scanner := NewScanner(client, store, cfg)
+	scanner := newTestScanner(t, client, store, cfg)
 
 	firstResult, err := scanner.ScanOnce(context.Background())
 	if err != nil {

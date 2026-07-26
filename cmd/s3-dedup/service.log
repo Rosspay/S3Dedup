@@ -1,0 +1,12 @@
+2026/07/26 14:45:45.570545 INFO Scan 1785077145570021900 started at 2026-07-26 14:45:45.5700219 +0000 UTC
+2026/07/26 14:45:45.570545 INFO Listing objects in bucket my-bucket prefix my-prefix/
+2026/07/26 14:45:45.813921 INFO Blobs removed: 0, bytes reclaimed: 0
+2026/07/26 14:46:06.504347 INFO Scan 1785077166504347500 started at 2026-07-26 14:46:06.5043475 +0000 UTC
+2026/07/26 14:46:06.504875 INFO Listing objects in bucket my-bucket prefix my-prefix/
+2026/07/26 14:46:06.734805 INFO Blobs removed: 0, bytes reclaimed: 0
+2026/07/26 14:46:09.260546 INFO Scan 1785077169260546500 started at 2026-07-26 14:46:09.2605465 +0000 UTC
+2026/07/26 14:46:09.260546 INFO Listing objects in bucket my-bucket prefix my-prefix/
+2026/07/26 14:46:09.464043 INFO Blobs removed: 0, bytes reclaimed: 0
+2026/07/26 14:46:10.771077 INFO Scan 1785077170771077000 started at 2026-07-26 14:46:10.771077 +0000 UTC
+2026/07/26 14:46:10.771077 INFO Listing objects in bucket my-bucket prefix my-prefix/
+2026/07/26 14:46:10.975778 INFO Blobs removed: 0, bytes reclaimed: 0

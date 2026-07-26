@@ -31,7 +31,7 @@ func TestScanOnceFindDuplicateContent(t *testing.T) {
 		errors: make(map[string]error),
 	}
 
-	scanner := NewScanner(client, store, testConfig())
+	scanner := newTestScanner(t, client, store, testConfig())
 	res, err := scanner.ScanOnce(context.Background())
 	if err != nil {
 		t.Fatalf("ScanOnce error: %v", err)
@@ -80,7 +80,7 @@ func TestScanOnceNoObjectLostDupes(t *testing.T) {
 	}
 	config := testConfig()
 	config.Schedule.Workers = 4
-	scanner := NewScanner(client, store, config)
+	scanner := newTestScanner(t, client, store, config)
 	res, err := scanner.ScanOnce(context.Background())
 	if err != nil {
 		t.Fatalf("ScanOnce error: %v", err)
@@ -123,7 +123,7 @@ func TestScanOnceNoObjectLostDupeless(t *testing.T) {
 
 	config := testConfig()
 	config.Schedule.Workers = 6
-	scanner := NewScanner(client, store, config)
+	scanner := newTestScanner(t, client, store, config)
 	res, err := scanner.ScanOnce(context.Background())
 	if err != nil {
 		t.Fatalf("ScanOnce error: %v", err)
@@ -158,7 +158,7 @@ func TestPointerModeDuplicateObjectsCreateOneBlob(t *testing.T) {
 	}
 
 	cfg := pointerTestConfig()
-	result, err := NewScanner(client, store, cfg).ScanOnce(context.Background())
+	result, err := newTestScanner(t, client, store, cfg).ScanOnce(context.Background())
 	if err != nil {
 		t.Fatalf("ScanOnce error: %v", err)
 	}
@@ -199,7 +199,7 @@ func TestPointerModeDifferentContentsCreateDifferentBlobs(t *testing.T) {
 	}
 	cfg := pointerTestConfig()
 
-	result, err := NewScanner(client, store, cfg).ScanOnce(context.Background())
+	result, err := newTestScanner(t, client, store, cfg).ScanOnce(context.Background())
 	if err != nil {
 		t.Fatalf("ScanOnce error: %v", err)
 	}
@@ -230,7 +230,7 @@ func TestPointerModeObjectsInsideBlobPrefixAreNotScanned(t *testing.T) {
 	}
 	cfg := pointerTestConfig()
 
-	result, err := NewScanner(client, store, cfg).ScanOnce(context.Background())
+	result, err := newTestScanner(t, client, store, cfg).ScanOnce(context.Background())
 	if err != nil {
 		t.Fatalf("ScanOnce error: %v", err)
 	}
@@ -273,7 +273,7 @@ func TestPointerModePointerCanReferenceBlobInDifferentBucket(t *testing.T) {
 	cfg := pointerTestConfig()
 	cfg.S3.Buckets[0].Name = sourceBucket
 
-	result, err := NewScanner(client, store, cfg).ScanOnce(context.Background())
+	result, err := newTestScanner(t, client, store, cfg).ScanOnce(context.Background())
 	if err != nil {
 		t.Fatalf("ScanOnce error: %v", err)
 	}

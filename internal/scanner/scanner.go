@@ -11,6 +11,7 @@ import (
 	"s3-dedup/internal/cache"
 	"s3-dedup/internal/config"
 	"s3-dedup/internal/hashing"
+	"s3-dedup/internal/logger"
 	"s3-dedup/internal/pointer"
 	"s3-dedup/internal/report"
 	"strings"
@@ -65,6 +66,7 @@ type Scanner struct {
 	s3Client S3Client
 	store    cache.Store
 	config   *config.Config
+	logging  *logger.Logger
 }
 
 type objectJob struct {
@@ -73,11 +75,12 @@ type objectJob struct {
 	scanID string
 }
 
-func NewScanner(s3Client S3Client, store cache.Store, config *config.Config) *Scanner {
+func NewScanner(s3Client S3Client, store cache.Store, config *config.Config, logging *logger.Logger) *Scanner {
 	return &Scanner{
 		s3Client: s3Client,
 		store:    store,
 		config:   config,
+		logging:  logging,
 	}
 }
 
@@ -106,7 +109,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 		scanReport.ObjectsRelinked = objectsRelinked.Load()
 		scanReport.BytesReclaimed = bytesReclaimed.Load()
 	}()
-
+	s.logging.Infof("Scan %s started at %s\n", scanID, scanReport.ScanStarted)
 	for _, bucket := range s.config.S3.Buckets {
 		jobs := make(chan objectJob, workers)
 		var wg sync.WaitGroup
@@ -138,7 +141,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 					}
 					if processErr != nil {
 						processErrors.Add(1)
-						fmt.Printf("Processing object %s/%s: %v\n", job.buket, job.info.Key, processErr)
+						s.logging.Errorf("Processing object %s/%s: %v\n", job.buket, job.info.Key, processErr)
 					}
 				}
 			}()
@@ -162,6 +165,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 					return fmt.Errorf("check cached object %q: %w", info.Key, err)
 				}
 				if isUnchanged {
+					s.logging.Debugf("Object %s/%s because unchanged\n", bucket.Name, info.Key)
 					return nil
 				}
 				select {
@@ -181,6 +185,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 
 		if err != nil {
 			scanReport.Errors++
+			s.logging.Errorf("Listing object error %v, stopping scan\n", err)
 			return scanReport, err
 		}
 
@@ -200,10 +205,11 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 			scanReport.Errors++
 			return scanReport, fmt.Errorf("garbage collection: %w", err)
 		}
+		s.logging.Infof("Blobs removed: %d, bytes reclaimed: %d\n", removedBlobs, gcBytes)
 	}
 
 	bytesReclaimed.Add(gcBytes)
-	fmt.Printf("Blobs removed: %d, bytes reclaimed: %d\n", removedBlobs, gcBytes)
+
 	stats, err := s.store.GetStats(ctx)
 	if err != nil {
 		scanReport.Errors++
@@ -226,6 +232,7 @@ func (s *Scanner) processObject(ctx context.Context, bucket string,
 		return err
 	}
 	if statObj.ContentType == pointer.ContentPointerType {
+		s.logging.Debugf("Object %s/%s is a pointer\n", bucket, info.Key)
 		return s.processPointer(ctx, bucket, info, scanID)
 	}
 
@@ -299,7 +306,7 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 			return 0, false, fmt.Errorf("Consistency for PutObject error: Blob %q size mismatch", blobKey)
 		}
 		reclaimed -= n
-		fmt.Printf("Blob %s of size %d was put\n", blobKey, n)
+		s.logging.Debugf("Blob %s of size %d was put\n", blobKey, n)
 	default:
 		return 0, false, fmt.Errorf("StatObject for blob %q: %w", blobKey, err)
 	}
@@ -318,6 +325,7 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 	relinked := false
 	flagChanged := isObjectChanged(statObj, isChanged)
 	if s.config.Dedup.DeleteOriginals && !flagChanged {
+		s.logging.Infof("Replacing object %s/%s with pointer", bucket, info.Key)
 		res, err = s.safeReplace(ctx, bucket, info, hash)
 		if err != nil {
 			return 0, false, fmt.Errorf("processObjectPointer %q/%q: %w", bucket, info.Key, err)

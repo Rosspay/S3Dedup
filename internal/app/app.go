@@ -2,9 +2,11 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"s3-dedup/internal/cache"
 	"s3-dedup/internal/config"
+	"s3-dedup/internal/logger"
 	"s3-dedup/internal/s3"
 	"s3-dedup/internal/scanner"
 )
@@ -13,6 +15,7 @@ type App struct {
 	Config  *config.Config
 	Scanner *scanner.Scanner
 	store   cache.Store
+	Logger  *logger.Logger
 }
 
 func Open(ctx context.Context, configPath string) (*App, error) {
@@ -21,7 +24,12 @@ func Open(ctx context.Context, configPath string) (*App, error) {
 		return nil, fmt.Errorf("load config: %w", err)
 	}
 
-	s3Client, err := s3.NewClient(ctx, cfg)
+	logging, err := logger.New(cfg.Logging.Level, cfg.Logging.File)
+	if err != nil {
+		return nil, fmt.Errorf("logger.New: %w", err)
+	}
+
+	s3Client, err := s3.NewClient(ctx, cfg, *logging)
 	if err != nil {
 		return nil, fmt.Errorf("create S3 client: %w", err)
 	}
@@ -35,15 +43,18 @@ func Open(ctx context.Context, configPath string) (*App, error) {
 		return nil, fmt.Errorf("open cache: %w", err)
 	}
 
-	scannerService := scanner.NewScanner(s3Client, store, cfg)
+	scannerService := scanner.NewScanner(s3Client, store, cfg, logging)
 
 	return &App{
 		Config:  cfg,
 		Scanner: scannerService,
 		store:   store,
+		Logger:  logging,
 	}, nil
 }
 
 func (a *App) Close() error {
-	return a.store.Close()
+	storeCloseErr := a.store.Close()
+	logCloseErr := a.Logger.Close()
+	return errors.Join(storeCloseErr, logCloseErr)
 }

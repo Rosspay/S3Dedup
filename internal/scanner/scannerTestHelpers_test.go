@@ -6,12 +6,33 @@ import (
 	"s3-dedup/internal/cache"
 	"s3-dedup/internal/config"
 	"s3-dedup/internal/hashing"
+	"s3-dedup/internal/logger"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/minio/minio-go/v6"
 )
+
+func newTestScanner(
+	t *testing.T,
+	client S3Client,
+	store cache.Store,
+	cfg *config.Config,
+) *Scanner {
+	t.Helper()
+
+	logging, err := logger.New("error", filepath.Join(t.TempDir(), "scanner.log"))
+	if err != nil {
+		t.Fatalf("logger.New error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := logging.Close(); err != nil {
+			t.Errorf("logger Close error: %v", err)
+		}
+	})
+	return NewScanner(client, store, cfg, logging)
+}
 
 func openTestStore(t *testing.T) *cache.SQLiteStore {
 	t.Helper()

@@ -31,7 +31,7 @@ func TestPointerModeRestartWithSameSQLiteDoesNotRewriteObjects(t *testing.T) {
 		},
 	}
 
-	firstResult, err := NewScanner(client, firstStore, cfg).ScanOnce(ctx)
+	firstResult, err := newTestScanner(t, client, firstStore, cfg).ScanOnce(ctx)
 	if err != nil {
 		firstStore.Close()
 		t.Fatalf("first ScanOnce error: %v", err)
@@ -67,7 +67,7 @@ func TestPointerModeRestartWithSameSQLiteDoesNotRewriteObjects(t *testing.T) {
 	client.errors[objectID("bucket", key)] = errors.New("unchanged pointer must not be read")
 	client.mu.Unlock()
 
-	secondResult, err := NewScanner(client, secondStore, cfg).ScanOnce(ctx)
+	secondResult, err := newTestScanner(t, client, secondStore, cfg).ScanOnce(ctx)
 	if err != nil {
 		t.Fatalf("second ScanOnce error: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestPointerModeRepeatedScanDoesNotUploadBlobAgain(t *testing.T) {
 	}
 	cfg := pointerTestConfig()
 	cfg.Dedup.DeleteOriginals = true
-	scanner := NewScanner(client, store, cfg)
+	scanner := newTestScanner(t, client, store, cfg)
 
 	firstResult, err := scanner.ScanOnce(context.Background())
 	if err != nil {
@@ -170,7 +170,7 @@ func TestPointerModeNextScanRecognizesPointerWithoutCreatingBlobAgain(t *testing
 	}
 	cfg := pointerTestConfig()
 	cfg.Dedup.DeleteOriginals = true
-	scanner := NewScanner(client, firstStore, cfg)
+	scanner := newTestScanner(t, client, firstStore, cfg)
 
 	firstResult, err := scanner.ScanOnce(context.Background())
 	if err != nil {
@@ -191,7 +191,7 @@ func TestPointerModeNextScanRecognizesPointerWithoutCreatingBlobAgain(t *testing
 	}
 
 	secondStore := openTestStore(t)
-	secondResult, err := NewScanner(client, secondStore, cfg).ScanOnce(context.Background())
+	secondResult, err := newTestScanner(t, client, secondStore, cfg).ScanOnce(context.Background())
 	if err != nil {
 		t.Fatalf("second ScanOnce error: %v", err)
 	}

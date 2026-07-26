@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"s3-dedup/internal/app"
+	"s3-dedup/internal/logger"
 	"s3-dedup/internal/report"
 
 	"github.com/spf13/cobra"
@@ -65,7 +66,7 @@ var runInterval = &cobra.Command{
 			return fmt.Errorf("Scan interval must be > 0")
 		}
 
-		return runLoop(ctx, interval, application.Scanner.ScanOnce, reportPath)
+		return runLoop(ctx, interval, application.Scanner.ScanOnce, reportPath, *application.Logger)
 	},
 }
 
@@ -98,33 +99,37 @@ func run(ctx context.Context, scan ScanFunc, out string) error {
 	return errors.Join(scanErr, writeErr)
 }
 
-func runLoop(ctx context.Context, interval time.Duration, scan ScanFunc, out string) error {
+func runLoop(ctx context.Context, interval time.Duration, scan ScanFunc, out string, logger logger.Logger) error {
 	stopCh := shutdownRequested(ctx)
 	i := 0
 	for {
 		//Checking before scan if shutdown requested, cancelling after first signal
 		select {
 		case <-stopCh:
+			logger.Infof("First shutdown signal got, shutting down before next scan\n")
 			return nil
 		case <-ctx.Done():
+			logger.Errorf("Second shutdown signal got, shutting down before next scan\n")
 			return ctx.Err()
 		default:
 		}
 
-		fmt.Printf("Scan N%d starts\n", i)
+		logger.Infof("Scan N%d starts\n", i)
 		if err := run(ctx, scan, out); err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
-			fmt.Printf("scan failed: %v\n", err)
+			logger.Errorf("scan failed: %v\n", err)
 		}
 		i++
 
 		//Checking signal after scan, so there is no timer waiting
 		select {
 		case <-stopCh:
+			logger.Infof("First shutdown signal got, shutting down before next scan\n")
 			return nil
 		case <-ctx.Done():
+			logger.Errorf("Second shutdown signal got, shutting down before next scan\n")
 			return ctx.Err()
 		default:
 		}

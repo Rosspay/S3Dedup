@@ -23,4 +23,4 @@ schedule:
   workers: 1 #
 logging:
   level: "info"
-  file: "/var/log/s3-dedup/service.log"
+  file: "service.log"
