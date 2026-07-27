@@ -17,7 +17,9 @@ import (
 )
 
 var configPath string
-var reportPath string
+var scanReportPath string
+var runReportPath string
+var reportOutputPath string
 
 type ScanFunc func(context.Context) (report.Report, error)
 
@@ -40,7 +42,7 @@ var scanOnce = &cobra.Command{
 		}
 		defer application.Close()
 
-		return run(ctx, application.Scanner.ScanOnce, reportPath)
+		return run(ctx, application.Scanner.ScanOnce, scanReportPath)
 	},
 }
 
@@ -49,24 +51,7 @@ var runInterval = &cobra.Command{
 	Short: "Scans S3 storage in interval from config",
 	Long:  "Scans S3 storage in interval from config",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx := cmd.Context()
-		application, err := app.Open(ctx, configPath)
-		if err != nil {
-			return err
-		}
-		defer application.Close()
-
-		interval, err := time.ParseDuration(
-			application.Config.Schedule.ScanInterval,
-		)
-		if err != nil {
-			return fmt.Errorf("Parse scan interval: %w", err)
-		}
-		if interval <= 0 {
-			return fmt.Errorf("Scan interval must be > 0")
-		}
-
-		return runLoop(ctx, interval, application.Scanner.ScanOnce, reportPath, *application.Logger)
+		return runPeriodic(cmd.Context(), configPath, runReportPath)
 	},
 }
 
@@ -79,7 +64,7 @@ var reportCommand = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("ReadJSON error: %w", err)
 		}
-		err = report.WriteJSON(reportPath, r)
+		err = report.WriteJSON(reportOutputPath, r)
 		if err != nil {
 			return fmt.Errorf("WriteJSON error: %w", err)
 		}
@@ -99,7 +84,68 @@ func run(ctx context.Context, scan ScanFunc, out string) error {
 	return errors.Join(scanErr, writeErr)
 }
 
-func runLoop(ctx context.Context, interval time.Duration, scan ScanFunc, out string, logger logger.Logger) error {
+type periodicJob struct {
+	application *app.App
+	interval    time.Duration
+	out         string
+}
+
+func newPeriodicJob(
+	ctx context.Context,
+	configPath,
+	out string,
+) (*periodicJob, error) {
+	application, err := app.Open(ctx, configPath)
+	if err != nil {
+		return nil, err
+	}
+
+	interval, err := time.ParseDuration(
+		application.Config.Schedule.ScanInterval,
+	)
+	if err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("parse scan interval: %w", err),
+			application.Close(),
+		)
+	}
+	if interval <= 0 {
+		return nil, errors.Join(
+			errors.New("scan interval must be > 0"),
+			application.Close(),
+		)
+	}
+
+	return &periodicJob{
+		application: application,
+		interval:    interval,
+		out:         out,
+	}, nil
+}
+
+func (j *periodicJob) Run(ctx context.Context) (resultErr error) {
+	defer func() {
+		resultErr = errors.Join(resultErr, j.application.Close())
+	}()
+
+	return runLoop(
+		ctx,
+		j.interval,
+		j.application.Scanner.ScanOnce,
+		j.out,
+		j.application.Logger,
+	)
+}
+
+func runPeriodic(ctx context.Context, configPath, out string) error {
+	job, err := newPeriodicJob(ctx, configPath, out)
+	if err != nil {
+		return err
+	}
+	return job.Run(ctx)
+}
+
+func runLoop(ctx context.Context, interval time.Duration, scan ScanFunc, out string, logger *logger.Logger) error {
 	stopCh := shutdownRequested(ctx)
 	i := 0
 	for {
@@ -159,14 +205,15 @@ func runLoop(ctx context.Context, interval time.Duration, scan ScanFunc, out str
 }
 
 func init() {
-	reportPath = "report.json"
 	scanOnce.Flags().StringVarP(&configPath, "config", "c", "", "Config path")
+	scanOnce.Flags().StringVarP(&scanReportPath, "out", "o", "report.json", "Report path")
 	scanOnce.MarkFlagRequired("config")
 
 	runInterval.Flags().StringVarP(&configPath, "config", "c", "", "Config path")
+	runInterval.Flags().StringVarP(&runReportPath, "out", "o", "report.json", "Report path")
 	runInterval.MarkFlagRequired("config")
 
-	reportCommand.Flags().StringVarP(&reportPath, "out", "o", "", "Report path")
+	reportCommand.Flags().StringVarP(&reportOutputPath, "out", "o", "", "Report path")
 	reportCommand.MarkFlagRequired("out")
 	rootCmd.AddCommand(scanOnce)
 	rootCmd.AddCommand(runInterval)

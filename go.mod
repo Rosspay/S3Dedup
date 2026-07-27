@@ -4,6 +4,7 @@ go 1.20
 
 require (
 	github.com/google/go-cmp v0.7.0
+	github.com/kardianos/service v1.2.2
 	github.com/kelseyhightower/envconfig v1.4.0
 	github.com/minio/minio-go/v6 v6.0.57
 	github.com/spf13/cobra v1.10.2

@@ -31,3 +31,12 @@ cmd/s3-dedup/state.db
 cmd/s3-dedup/state.db
 cmd/s3-dedup/report.json
 /testdata
+bin/s3-dedup-linux-amd64
+build/demo/s3-dedup.log
+build/demo/state.db
+build/demo/report-first.json
+build/demo/report-second.json
+cmd/s3-dedup/service.log
+cmd/s3-dedup/service.log
+cmd/s3-dedup/service.log
+configs/service.log

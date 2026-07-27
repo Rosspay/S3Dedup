@@ -1,0 +1,28 @@
+s3:
+  endpoint: "minio:9000"
+  region: "us-east-1"
+  access_key: ""
+  secret_key: ""
+  use_path_style: true
+  buckets:
+    - name: "s3-dedup-demo"
+      prefix: "input/"
+
+dedup:
+  hash_algo: "sha256"
+  min_size_bytes: 1
+  blob_prefix: "blobs/"
+  mode: "pointer"
+  delete_originals: true
+
+cache:
+  backend: "sqlite"
+  path: "/demo/state.db"
+
+schedule:
+  scan_interval: "1m"
+  workers: 2
+
+logging:
+  level: "info"
+  file: "/demo/s3-dedup.log"

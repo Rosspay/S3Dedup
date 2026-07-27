@@ -1,0 +1,23 @@
+FROM minio/mc:RELEASE.2025-08-13T08-35-41Z AS minio-client
+
+FROM golang:1.20.14-alpine3.19 AS builder
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+    -trimpath \
+    -o /out/s3-dedup \
+    ./cmd/s3-dedup
+
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates jq
+COPY --from=builder /out/s3-dedup /usr/local/bin/s3-dedup
+COPY --from=minio-client /usr/bin/mc /usr/local/bin/mc
+COPY configs/demo.yaml /etc/s3-dedup/demo.yaml
+COPY scripts/demo.sh /usr/local/bin/demo.sh
+RUN sed -i 's/\r$//' /usr/local/bin/demo.sh && chmod +x /usr/local/bin/demo.sh
+
+ENTRYPOINT ["/usr/local/bin/demo.sh"]
