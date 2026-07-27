@@ -30,7 +30,6 @@ internal/hashing/cover.txt
 cmd/s3-dedup/state.db
 cmd/s3-dedup/state.db
 cmd/s3-dedup/report.json
-/testdata
 bin/s3-dedup-linux-amd64
 build/demo/s3-dedup.log
 build/demo/state.db
