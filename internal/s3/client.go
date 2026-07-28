@@ -58,6 +58,16 @@ func (c *Client) HealthCheck(ctx context.Context, config *config.Config) error {
 			return fmt.Errorf("healthcheck bucket %q: bucket does not exist or is not accessible", bucket.Name)
 		}
 	}
+	blobBucketExists, err := c.S3Client.BucketExistsWithContext(ctx, config.Dedup.BlobBucket)
+	if err != nil {
+		return fmt.Errorf("Healthcheck blobBucket %q: %w", config.Dedup.BlobBucket, err)
+	}
+	if !blobBucketExists {
+		makeErr := c.S3Client.MakeBucketWithContext(ctx, config.Dedup.BlobBucket, config.S3.Region)
+		if makeErr != nil {
+			return fmt.Errorf("Healthcheck make blobBucket %q: %w", config.Dedup.BlobBucket, makeErr)
+		}
+	}
 
 	return nil
 }

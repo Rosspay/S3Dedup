@@ -39,3 +39,4 @@ cmd/s3-dedup/service.log
 cmd/s3-dedup/service.log
 cmd/s3-dedup/service.log
 configs/service.log
+/testdata/control

@@ -9,21 +9,18 @@ s3:
   buckets:
   - name: "my-bucket"
     prefix: "my-prefix/"
-  - name: "next-bucket"
-    prefix: "next-prefix/"
 dedup:
   hash_algo: "sha256"
   min_size_bytes: 100 #
-  blob_bucket: "blobs-bucket"
   blob_prefix: "blobs/"
   mode: "pointer" # report_only | pointer
   delete_originals: true # :
 cache:
   backend: "sqlite" # sqlite | leveldb
-  path: "state.db"
+  path: "D:\\S3Dedup\\cmd\\s3-dedup\\state.db"
 schedule:
-  scan_interval: "1m" #
+  scan_interval: "20s" #
   workers: 1 #
 logging:
-  level: "error"
+  level: "info"
   file: "service.log"

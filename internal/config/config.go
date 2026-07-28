@@ -29,6 +29,7 @@ type S3 struct {
 type Dedup struct {
 	HashAlgo        string `yaml:"hash_algo"`
 	MinSizeBytes    int64  `yaml:"min_size_bytes"`
+	BlobBucket      string `yaml:"blob_bucket"`
 	BlobPrefix      string `yaml:"blob_prefix"`
 	Mode            string `yaml:"mode"`
 	DeleteOriginals bool   `yaml:"delete_originals"`
@@ -85,6 +86,10 @@ func ConfigParser(filePath string) (*Config, error) {
 
 	if cfg.Cache.Backend != "sqlite" {
 		return nil, fmt.Errorf("ConfgiParser: cache backend must be sqlite, got %q", cfg.Cache.Backend)
+	}
+
+	if cfg.Dedup.BlobBucket == "" {
+		return nil, fmt.Errorf("ConfigParser: blob_bucket is not configured")
 	}
 
 	interval, err := time.ParseDuration(cfg.Schedule.ScanInterval)

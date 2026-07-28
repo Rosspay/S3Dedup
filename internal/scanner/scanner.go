@@ -18,7 +18,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	//"s3-dedup/internal/s3"
 	"strconv"
 	"time"
 
@@ -247,7 +246,7 @@ func (s *Scanner) processObject(ctx context.Context, bucket string,
 		return err
 	}
 
-	err = s.register(ctx, bucket, bucket, s.config.Dedup.BlobPrefix+hash, info, hash, info.Size, scanID)
+	err = s.register(ctx, bucket, s.config.Dedup.BlobBucket, s.config.Dedup.BlobPrefix+s.config.Dedup.HashAlgo+"/"+hash, info, hash, info.Size, scanID)
 	if err != nil {
 		return err
 	}
@@ -285,8 +284,11 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 		return 0, false, err
 	}
 
-	blobKey := s.config.Dedup.BlobPrefix + hash
-	statInfo, err := s.s3Client.StatObject(ctx, bucket, blobKey)
+	logicalBucket := bucket
+	logicalKey := info.Key
+	blobBucket := s.config.Dedup.BlobBucket
+	blobKey := s.config.Dedup.BlobPrefix + s.config.Dedup.HashAlgo + "/" + hash
+	statInfo, err := s.s3Client.StatObject(ctx, blobBucket, blobKey)
 	errCode := minio.ToErrorResponse(err).Code
 	var reclaimed int64
 	switch {
@@ -298,7 +300,7 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 		if _, err := temp.Seek(0, io.SeekStart); err != nil {
 			return 0, false, err
 		}
-		n, err := s.s3Client.PutObject(ctx, bucket, blobKey, temp, info.Size, info.ContentType)
+		n, err := s.s3Client.PutObject(ctx, blobBucket, blobKey, temp, info.Size, info.ContentType)
 		if err != nil {
 			return 0, false, err
 		}
@@ -311,12 +313,12 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 		return 0, false, fmt.Errorf("StatObject for blob %q: %w", blobKey, err)
 	}
 
-	statInfo, err = s.s3Client.StatObject(ctx, bucket, blobKey)
+	statInfo, err = s.s3Client.StatObject(ctx, blobBucket, blobKey)
 	if err != nil {
 		return 0, false, err
 	}
 
-	isChanged, err := s.s3Client.StatObject(ctx, bucket, info.Key)
+	isChanged, err := s.s3Client.StatObject(ctx, logicalBucket, logicalKey)
 	if err != nil {
 		return 0, false, err
 	}
@@ -326,7 +328,7 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 	flagChanged := isObjectChanged(statObj, isChanged)
 	if s.config.Dedup.DeleteOriginals && !flagChanged {
 		s.logging.Infof("Replacing object %s/%s with pointer", bucket, info.Key)
-		res, err = s.safeReplace(ctx, bucket, info, hash)
+		res, err = s.safeReplace(ctx, bucket, blobBucket, info, hash)
 		if err != nil {
 			return 0, false, fmt.Errorf("processObjectPointer %q/%q: %w", bucket, info.Key, err)
 		}
@@ -334,7 +336,7 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 	}
 
 	if !flagChanged {
-		err = s.register(ctx, bucket, bucket, blobKey, res, hash, info.Size, scanID)
+		err = s.register(ctx, logicalBucket, blobBucket, blobKey, res, hash, info.Size, scanID)
 		if err != nil {
 			return 0, false, err
 		}
@@ -353,7 +355,7 @@ func (s *Scanner) processPointer(ctx context.Context, bucket string, info minio.
 	if err != nil {
 		return err
 	}
-	if p.BlobKey != s.config.Dedup.BlobPrefix+p.Hash {
+	if p.BlobKey != s.config.Dedup.BlobPrefix+s.config.Dedup.HashAlgo+"/"+p.Hash {
 		return fmt.Errorf("Pointer key %q does not match %q", p.BlobKey, s.config.Dedup.BlobPrefix+p.Hash)
 	}
 
@@ -373,10 +375,10 @@ func (s *Scanner) processPointer(ctx context.Context, bucket string, info minio.
 	return nil
 }
 
-func (s *Scanner) safeReplace(ctx context.Context, bucket string, info minio.ObjectInfo, hash string) (minio.ObjectInfo, error) {
+func (s *Scanner) safeReplace(ctx context.Context, bucket string, blobBucket string, info minio.ObjectInfo, hash string) (minio.ObjectInfo, error) {
 	p := pointer.Pointer{
-		BlobBucket:  bucket,
-		BlobKey:     s.config.Dedup.BlobPrefix + hash,
+		BlobBucket:  blobBucket,
+		BlobKey:     s.config.Dedup.BlobPrefix + s.config.Dedup.HashAlgo + "/" + hash,
 		Hash:        hash,
 		Size:        info.Size,
 		ContentType: info.ContentType,
@@ -413,84 +415,72 @@ func (s *Scanner) collectGarbage(ctx context.Context) (int64, int64, error) {
 	var blobsRemoved int64
 	var errs []error
 
-	seenBuckets := make(map[string]struct{})
-	for _, configured := range s.config.S3.Buckets {
-		bucket := configured.Name
-		if _, exists := seenBuckets[bucket]; exists {
+	bucket := s.config.Dedup.BlobBucket
+
+	blobs, err := s.store.ListUnreferencedBlobs(ctx, bucket)
+	if err != nil {
+		return 0, 0, fmt.Errorf("list unreferenced blobs in blobBucket %q: %w", bucket, err)
+	}
+	if len(blobs) == 0 {
+		return 0, 0, nil
+	}
+
+	keys := make([]string, 0, len(blobs))
+	byKey := make(map[string]cache.BlobRecord, len(blobs))
+	for _, blob := range blobs {
+		if _, exists := byKey[blob.Key]; exists {
+			errs = append(errs, fmt.Errorf(
+				"duplicate blob key %q/%q in cache",
+				bucket,
+				blob.Key,
+			))
 			continue
 		}
-		seenBuckets[bucket] = struct{}{}
+		keys = append(keys, blob.Key)
+		byKey[blob.Key] = blob
+	}
 
-		blobs, err := s.store.ListUnreferencedBlobs(ctx, bucket)
-		if err != nil {
+	deletedKeys, removeErr := s.s3Client.RemoveObjects(
+		ctx,
+		bucket,
+		keys,
+	)
+
+	for _, key := range deletedKeys {
+		blob, exists := byKey[key]
+		if !exists {
 			errs = append(errs, fmt.Errorf(
-				"list unreferenced blobs in %q: %w",
+				"S3 returned unknown deleted key %q/%q",
 				bucket,
+				key,
+			))
+			continue
+		}
+
+		if err := s.store.DeleteUnreferencedBlob(
+			ctx,
+			blob.Bucket,
+			blob.Hash,
+		); err != nil {
+			errs = append(errs, fmt.Errorf(
+				"delete blob %q/%q from cache: %w",
+				blob.Bucket,
+				blob.Key,
 				err,
 			))
 			continue
 		}
-		if len(blobs) == 0 {
-			continue
-		}
 
-		keys := make([]string, 0, len(blobs))
-		byKey := make(map[string]cache.BlobRecord, len(blobs))
-		for _, blob := range blobs {
-			if _, exists := byKey[blob.Key]; exists {
-				errs = append(errs, fmt.Errorf(
-					"duplicate blob key %q/%q in cache",
-					bucket,
-					blob.Key,
-				))
-				continue
-			}
-			keys = append(keys, blob.Key)
-			byKey[blob.Key] = blob
-		}
+		blobsRemoved++
+		bytesReclaimed += blob.Size
+	}
 
-		deletedKeys, removeErr := s.s3Client.RemoveObjects(
-			ctx,
+	if removeErr != nil {
+		errs = append(errs, fmt.Errorf(
+			"remove unreferenced blobs from %q: %w",
 			bucket,
-			keys,
-		)
-
-		for _, key := range deletedKeys {
-			blob, exists := byKey[key]
-			if !exists {
-				errs = append(errs, fmt.Errorf(
-					"S3 returned unknown deleted key %q/%q",
-					bucket,
-					key,
-				))
-				continue
-			}
-
-			if err := s.store.DeleteUnreferencedBlob(
-				ctx,
-				blob.Bucket,
-				blob.Hash,
-			); err != nil {
-				errs = append(errs, fmt.Errorf(
-					"delete blob %q/%q from cache: %w",
-					blob.Bucket,
-					blob.Key,
-					err,
-				))
-				continue
-			}
-
-			blobsRemoved++
-			bytesReclaimed += blob.Size
-		}
-
-		if removeErr != nil {
-			errs = append(errs, fmt.Errorf(
-				"remove unreferenced blobs from %q: %w",
-				bucket,
-				removeErr,
-			))
-		}
+			removeErr,
+		))
 	}
 
 	return bytesReclaimed, blobsRemoved, errors.Join(errs...)

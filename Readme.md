@@ -44,8 +44,6 @@ scripts/            сценарий Docker demo
 Для сборки и тестов:
 
 - Go 1.20;
-- GNU Make;
-- Git.
 
 Для `make demo` дополнительно нужны:
 
@@ -338,7 +336,7 @@ Report будет находиться в:
 Логи:
 
 ```bash
-sudo cat /var/log/s3-dedup/service.log
+sudo cat /etc/s3-dedup/service.log
 sudo journalctl -u s3-dedup --no-pager -n 50
 ```
 
