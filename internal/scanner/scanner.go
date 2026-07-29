@@ -301,34 +301,39 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 	blobBucket := s.config.Dedup.BlobBucket
 	blobKey := s.config.Dedup.BlobPrefix + s.config.Dedup.HashAlgo + "/" + hash
 	mu := s.blobMutex(blobBucket, blobKey)
-	mu.Lock()
-	statInfo, err := s.s3Client.StatObject(ctx, blobBucket, blobKey)
-	errCode := minio.ToErrorResponse(err).Code
-	var reclaimed int64
-	switch {
-	case err == nil:
-		if statInfo.Size != info.Size {
-			return 0, false, fmt.Errorf("Consistency error: Blob %q size mismatch", blobKey)
-		}
-	case errCode == "NoSuchKey":
-		if _, err := temp.Seek(0, io.SeekStart); err != nil {
-			return 0, false, err
-		}
-		n, err := s.s3Client.PutObject(ctx, blobBucket, blobKey, temp, info.Size, info.ContentType)
-		if err != nil {
-			return 0, false, err
-		}
-		if n != info.Size {
-			return 0, false, fmt.Errorf("Consistency for PutObject error: Blob %q size mismatch", blobKey)
-		}
-		reclaimed -= n
-		s.logging.Debugf("Blob %s of size %d was put\n", blobKey, n)
-	default:
-		return 0, false, fmt.Errorf("StatObject for blob %q: %w", blobKey, err)
-	}
-	mu.Unlock()
 
-	statInfo, err = s.s3Client.StatObject(ctx, blobBucket, blobKey)
+	reclaimed, err := func() (int64, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		statInfo, err := s.s3Client.StatObject(ctx, blobBucket, blobKey)
+		errCode := minio.ToErrorResponse(err).Code
+		var reclaimed int64
+		switch {
+		case err == nil:
+			if statInfo.Size != info.Size {
+				return 0, fmt.Errorf("Consistency error: Blob %q size mismatch", blobKey)
+			}
+		case errCode == "NoSuchKey":
+			if _, err := temp.Seek(0, io.SeekStart); err != nil {
+				return 0, err
+			}
+			n, err := s.s3Client.PutObject(ctx, blobBucket, blobKey, temp, info.Size, info.ContentType)
+			if err != nil {
+				return 0, err
+			}
+			if n != info.Size {
+				return 0, fmt.Errorf("Consistency for PutObject error: Blob %q size mismatch", blobKey)
+			}
+			reclaimed -= n
+			s.logging.Debugf("Blob %s of size %d was put\n", blobKey, n)
+			return reclaimed, nil
+		default:
+			return 0, fmt.Errorf("StatObject for blob %q: %w", blobKey, err)
+		}
+		return 0, nil
+	}()
+
+	_, err = s.s3Client.StatObject(ctx, blobBucket, blobKey)
 	if err != nil {
 		return 0, false, err
 	}
