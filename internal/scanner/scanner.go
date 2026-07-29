@@ -109,43 +109,44 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 		scanReport.ObjectsRelinked = objectsRelinked.Load()
 		scanReport.BytesReclaimed = bytesReclaimed.Load()
 	}()
+	jobs := make(chan objectJob, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < int(workers); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			for job := range jobs {
+				var processErr error
+				switch s.config.Dedup.Mode {
+				case "report_only":
+					processErr = s.processObject(ctx, job.buket, job.info, job.scanID)
+				case "pointer":
+					var reclaimed int64
+					var relinked bool
+					reclaimed, relinked, processErr = s.processObjectPointer(ctx, job.buket, job.info, job.scanID)
+
+					if s.config.Dedup.DeleteOriginals && processErr == nil {
+						if relinked {
+							objectsRelinked.Add(1)
+						}
+						if reclaimed > 0 {
+							bytesReclaimed.Add(reclaimed)
+						}
+					}
+				default:
+					processErr = fmt.Errorf("Mode %q is not supported", s.config.Dedup.Mode)
+				}
+				if processErr != nil {
+					processErrors.Add(1)
+					s.logging.Errorf("Processing object %s/%s: %v\n", job.buket, job.info.Key, processErr)
+				}
+			}
+		}()
+	}
+
 	s.logging.Infof("Scan %s started at %s\n", scanID, scanReport.ScanStarted)
 	for _, bucket := range s.config.S3.Buckets {
-		jobs := make(chan objectJob, workers)
-		var wg sync.WaitGroup
-		for i := 0; i < int(workers); i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-
-				for job := range jobs {
-					var processErr error
-					switch s.config.Dedup.Mode {
-					case "report_only":
-						processErr = s.processObject(ctx, job.buket, job.info, job.scanID)
-					case "pointer":
-						var reclaimed int64
-						var relinked bool
-						reclaimed, relinked, processErr = s.processObjectPointer(ctx, job.buket, job.info, job.scanID)
-
-						if s.config.Dedup.DeleteOriginals && processErr == nil {
-							if relinked {
-								objectsRelinked.Add(1)
-							}
-							if reclaimed > 0 {
-								bytesReclaimed.Add(reclaimed)
-							}
-						}
-					default:
-						processErr = fmt.Errorf("Mode %q is not supported", s.config.Dedup.Mode)
-					}
-					if processErr != nil {
-						processErrors.Add(1)
-						s.logging.Errorf("Processing object %s/%s: %v\n", job.buket, job.info.Key, processErr)
-					}
-				}
-			}()
-		}
 		err := s.s3Client.ListObjects(ctx, bucket.Name, bucket.Prefix, true,
 			func(info minio.ObjectInfo) error {
 				if strings.HasPrefix(info.Key, s.config.Dedup.BlobPrefix) {
@@ -183,22 +184,23 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 				}
 			})
 
-		close(jobs)
-		wg.Wait()
-
 		if err != nil {
 			scanReport.Errors++
 			s.logging.Errorf("Listing object error %v, stopping scan\n", err)
 			return scanReport, err
 		}
 
-		_, err = s.store.FinalizeScope(ctx, bucket.Name, bucket.Prefix, scanID)
+	}
+	close(jobs)
+	wg.Wait()
+	for _, bucket := range s.config.S3.Buckets {
+		_, err := s.store.FinalizeScope(ctx, bucket.Name, bucket.Prefix, scanID)
 		if err != nil {
 			scanReport.Errors++
 			return scanReport, fmt.Errorf("FinalizeScope for %q/%q: %w", bucket.Name, bucket.Prefix, err)
 		}
-
 	}
+
 	var gcBytes int64
 	var removedBlobs int64
 	var err error
