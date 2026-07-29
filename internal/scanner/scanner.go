@@ -160,14 +160,17 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 					return s.store.UnregisterObject(ctx, bucket.Name, info.Key)
 				}
 				objectsScanned.Add(1)
-				isUnchanged, err := s.store.IsObjectUnchanged(ctx, bucket.Name, info.Key, info.ETag, info.Size, info.LastModified)
+				unchanged, state, err := s.store.GetObjectStatus(ctx, bucket.Name, info.Key, info.ETag, info.Size, info.LastModified)
 				if err != nil {
-					return fmt.Errorf("check cached object %q: %w", info.Key, err)
+					s.logging.Errorf("GetObjectStatus %s/%s: %v", bucket.Name, info.Key, err)
+					scanReport.Errors++
+					return fmt.Errorf("GetObjectStatus %q/%q: %w", bucket.Name, info.Key, err)
 				}
-				if isUnchanged {
-					s.logging.Debugf("Object %s/%s because unchanged\n", bucket.Name, info.Key)
+				if unchanged && stateRank(state) >= stateRank(desiredState(s.config)) {
+					s.logging.Debugf("Object %s/%s skipped because unchanged and ready\n", bucket.Name, info.Key)
 					return nil
 				}
+
 				select {
 				case jobs <- objectJob{
 					buket:  bucket.Name,
@@ -247,7 +250,7 @@ func (s *Scanner) processObject(ctx context.Context, bucket string,
 		return err
 	}
 
-	err = s.register(ctx, bucket, s.config.Dedup.BlobBucket, s.config.Dedup.BlobPrefix+s.config.Dedup.HashAlgo+"/"+hash, info, hash, info.Size, scanID)
+	err = s.register(ctx, bucket, s.config.Dedup.BlobBucket, s.config.Dedup.BlobPrefix+s.config.Dedup.HashAlgo+"/"+hash, info, hash, info.Size, scanID, cache.ObjectStateReported)
 	if err != nil {
 		return err
 	}
@@ -345,8 +348,13 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 		relinked = true
 	}
 
+	state := cache.ObjectStateBlobReady
+	if relinked {
+		state = cache.ObjectStatePointer
+	}
+
 	if !flagChanged {
-		err = s.register(ctx, logicalBucket, blobBucket, blobKey, res, hash, info.Size, scanID)
+		err = s.register(ctx, logicalBucket, blobBucket, blobKey, res, hash, info.Size, scanID, state)
 		if err != nil {
 			return 0, false, err
 		}
@@ -377,7 +385,7 @@ func (s *Scanner) processPointer(ctx context.Context, bucket string, info minio.
 		return fmt.Errorf("%q/%q: Pointer-object mismatch", bucket, info.Key)
 	}
 
-	err = s.register(ctx, bucket, p.BlobBucket, p.BlobKey, info, p.Hash, p.Size, scanID)
+	err = s.register(ctx, bucket, p.BlobBucket, p.BlobKey, info, p.Hash, p.Size, scanID, cache.ObjectStatePointer)
 	if err != nil {
 		return err
 	}
@@ -525,6 +533,7 @@ func (s *Scanner) register(
 	hash string,
 	blobSize int64,
 	scanID string,
+	state cache.ObjectState,
 ) error {
 	record := cache.ObjectRecord{
 		Bucket:       bucket,
@@ -537,6 +546,7 @@ func (s *Scanner) register(
 		LastModified: info.LastModified,
 		Hash:         hash,
 		LastSeenScan: scanID,
+		State:        state,
 	}
 
 	err := s.store.RegisterObject(ctx, record)
@@ -544,4 +554,27 @@ func (s *Scanner) register(
 		return err
 	}
 	return nil
+}
+
+func desiredState(cfg *config.Config) cache.ObjectState {
+	if cfg.Dedup.Mode == "report_only" {
+		return cache.ObjectStateReported
+	}
+	if !cfg.Dedup.DeleteOriginals {
+		return cache.ObjectStateBlobReady
+	}
+	return cache.ObjectStatePointer
+}
+
+func stateRank(state cache.ObjectState) int {
+	switch state {
+	case cache.ObjectStateReported:
+		return 1
+	case cache.ObjectStateBlobReady:
+		return 2
+	case cache.ObjectStatePointer:
+		return 3
+	default:
+		return 0
+	}
 }

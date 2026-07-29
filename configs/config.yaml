@@ -17,7 +17,7 @@ dedup:
   blob_bucket: "blobs-bucket"
   blob_prefix: "blobs/"
   mode: "pointer" # report_only | pointer
-  delete_originals: false # :
+  delete_originals: true # :
 cache:
   backend: "sqlite" # sqlite | leveldb
   path: "state.db"
@@ -25,5 +25,5 @@ schedule:
   scan_interval: "1m" #
   workers: 16 #
 logging:
-  level: "debug"
+  level: "error"
   file: "service.log"

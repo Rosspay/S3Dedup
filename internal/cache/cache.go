@@ -8,7 +8,15 @@ import (
 type Store interface {
 	RegisterObject(ctx context.Context, object ObjectRecord) error
 	UnregisterObject(ctx context.Context, bucket string, key string) error
-	IsObjectUnchanged(ctx context.Context, bucket, key, etag string, size int64, lastModified time.Time) (bool, error)
+	//IsObjectUnchanged(ctx context.Context, bucket, key, etag string, size int64, lastModified time.Time) (bool, bool, error)
+	GetObjectStatus(
+		ctx context.Context,
+		bucket string,
+		key string,
+		etag string,
+		size int64,
+		lastModified time.Time,
+	) (unchanged bool, state ObjectState, err error)
 	GetStats(ctx context.Context) (Stats, error)
 	MarkObjectSeen(ctx context.Context, bucket, key, scanID string) error
 	FinalizeScope(ctx context.Context, bucket, prefix, scanID string) (removed int64, err error)
@@ -16,6 +24,14 @@ type Store interface {
 	DeleteUnreferencedBlob(ctx context.Context, bucket string, hash string) error
 	Close() error
 }
+
+type ObjectState string
+
+const (
+	ObjectStateReported  ObjectState = "reported"
+	ObjectStateBlobReady ObjectState = "blob_ready"
+	ObjectStatePointer   ObjectState = "pointer"
+)
 
 type ObjectRecord struct {
 	Bucket       string
@@ -28,6 +44,7 @@ type ObjectRecord struct {
 	LastModified time.Time
 	Hash         string
 	LastSeenScan string
+	State        ObjectState
 }
 
 type BlobRecord struct {

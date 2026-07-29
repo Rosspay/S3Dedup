@@ -70,6 +70,7 @@ func (s *SQLiteStore) initialize(ctx context.Context) error {
 			blob_bucket TEXT NOT NULL,
 			blob_hash TEXT NOT NULL,
 			last_seen_scan TEXT NOT NULL,
+			object_state TEXT NOT NULL CHECK (object_state = "reported" OR object_state = "blob_ready" OR object_state = "pointer"),
 			PRIMARY KEY (bucket, object_key),
 			FOREIGN KEY (blob_bucket, blob_hash) REFERENCES blobs(bucket, hash)
 		)`,
@@ -110,8 +111,8 @@ func (s *SQLiteStore) RegisterObject(ctx context.Context, object ObjectRecord) e
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO objects (
-				bucket, object_key, etag, size, last_modified, blob_bucket, blob_hash, last_seen_scan
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+				bucket, object_key, etag, size, last_modified, blob_bucket, blob_hash, last_seen_scan, object_state
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`,
 			object.Bucket,
 			object.Key,
@@ -121,6 +122,7 @@ func (s *SQLiteStore) RegisterObject(ctx context.Context, object ObjectRecord) e
 			object.BlobBucket,
 			object.Hash,
 			object.LastSeenScan,
+			object.State,
 		); err != nil {
 			return fmt.Errorf("register object %q/%q: insert object: %w", object.Bucket, object.Key, err)
 		}
@@ -129,13 +131,14 @@ func (s *SQLiteStore) RegisterObject(ctx context.Context, object ObjectRecord) e
 	case oldBlobBucket == object.BlobBucket && oldHash == object.Hash:
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE objects
-			SET etag = ?, size = ?, last_modified = ?, last_seen_scan = ?
+			SET etag = ?, size = ?, last_modified = ?, last_seen_scan = ?, object_state = ?
 			WHERE bucket = ? AND object_key = ?
 		`,
 			object.ETag,
 			object.Size,
 			object.LastModified.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"),
 			object.LastSeenScan,
+			object.State,
 			object.Bucket,
 			object.Key,
 		); err != nil {
@@ -150,7 +153,7 @@ func (s *SQLiteStore) RegisterObject(ctx context.Context, object ObjectRecord) e
 		}
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE objects
-			SET etag = ?, size = ?, last_modified = ?, blob_bucket = ?, blob_hash = ?, last_seen_scan = ?
+			SET etag = ?, size = ?, last_modified = ?, blob_bucket = ?, blob_hash = ?, last_seen_scan = ?, object_state = ?
 			WHERE bucket = ? AND object_key = ?
 		`,
 			object.ETag,
@@ -159,6 +162,7 @@ func (s *SQLiteStore) RegisterObject(ctx context.Context, object ObjectRecord) e
 			object.BlobBucket,
 			object.Hash,
 			object.LastSeenScan,
+			object.State,
 			object.Bucket,
 			object.Key,
 		); err != nil {
@@ -213,32 +217,60 @@ func (s *SQLiteStore) UnregisterObject(
 	return nil
 }
 
-func (s *SQLiteStore) IsObjectUnchanged(
+// func (s *SQLiteStore) IsObjectUnchanged(
+// 	ctx context.Context,
+// 	bucket string,
+// 	key string,
+// 	etag string,
+// 	size int64,
+// 	lastModified time.Time,
+// ) (bool, bool, error) {
+// 	const query = `
+// 	SELECT is_pointer FROM objects
+// 	WHERE bucket = ?
+// 	AND object_key = ?
+// 	AND etag = ?
+// 	AND size = ?
+// 	AND last_modified = ?
+// 	`
+
+// 	var isPointer bool
+// 	err := s.db.QueryRowContext(ctx, query, bucket, key, etag, size, lastModified.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")).Scan(&isPointer)
+// 	switch {
+// 	case errors.Is(err, sql.ErrNoRows):
+// 		return false, isPointer, nil
+// 	case err != nil:
+// 		return false, isPointer, fmt.Errorf("check object %q/%q: %w", bucket, key, err)
+// 	}
+// 	return true, isPointer, nil
+// }
+
+func (s *SQLiteStore) GetObjectStatus(
 	ctx context.Context,
 	bucket string,
 	key string,
 	etag string,
 	size int64,
 	lastModified time.Time,
-) (bool, error) {
+) (unchanged bool, state ObjectState, err error) {
 	const query = `
-	SELECT 1 FROM objects
+	SELECT object_state FROM objects
 	WHERE bucket = ?
 	AND object_key = ? 
 	AND etag = ?
 	AND size = ?
 	AND last_modified = ?
 	`
-
-	var found int
-	err := s.db.QueryRowContext(ctx, query, bucket, key, etag, size, lastModified.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")).Scan(&found)
+	err = s.db.QueryRowContext(ctx, query, bucket, key, etag, size, lastModified.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")).Scan(&state)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		return false, nil
+		return false, "", nil
 	case err != nil:
-		return false, fmt.Errorf("check object %q/%q: %w", bucket, key, err)
+		return false, "", fmt.Errorf("GetObjectStatus %q/%q: %w", bucket, key, err)
+	case state == "":
+		return false, "", fmt.Errorf("GetObjectsStatus %q/%q: undefined object_state in cache", bucket, key)
 	}
-	return true, nil
+	return true, state, nil
 }
 
 func validateObject(object ObjectRecord) error {
