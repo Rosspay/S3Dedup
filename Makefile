@@ -4,7 +4,7 @@ DIST := bin
 GO := go
 
 LINUX_BIN := $(DIST)/$(APP)-linux-amd64
-WINDOWS_BIN := $(DIST)/$(APP)-windows-amd64.exe
+WINDOWS_BIN := $(DIST)/$(APP).exe
 DEMO_COMPOSE := docker compose -f compose.demo.yaml
 
 ifeq ($(OS),Windows_NT)

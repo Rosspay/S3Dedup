@@ -62,10 +62,11 @@ type S3Client interface {
 }
 
 type Scanner struct {
-	s3Client S3Client
-	store    cache.Store
-	config   *config.Config
-	logging  *logger.Logger
+	s3Client  S3Client
+	store     cache.Store
+	config    *config.Config
+	logging   *logger.Logger
+	blobLocks sync.Map
 }
 
 type objectJob struct {
@@ -254,6 +255,12 @@ func (s *Scanner) processObject(ctx context.Context, bucket string,
 	return nil
 }
 
+func (s *Scanner) blobMutex(blobBucket, blobKey string) *sync.Mutex {
+	key := blobBucket + s.config.Dedup.HashAlgo + "/" + blobKey
+	mu, _ := s.blobLocks.LoadOrStore(key, &sync.Mutex{})
+	return mu.(*sync.Mutex)
+}
+
 func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info minio.ObjectInfo, scanID string) (int64, bool, error) {
 	statObj, err := s.s3Client.StatObject(ctx, bucket, info.Key)
 	if err != nil {
@@ -288,6 +295,8 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 	logicalKey := info.Key
 	blobBucket := s.config.Dedup.BlobBucket
 	blobKey := s.config.Dedup.BlobPrefix + s.config.Dedup.HashAlgo + "/" + hash
+	mu := s.blobMutex(blobBucket, blobKey)
+	mu.Lock()
 	statInfo, err := s.s3Client.StatObject(ctx, blobBucket, blobKey)
 	errCode := minio.ToErrorResponse(err).Code
 	var reclaimed int64
@@ -312,6 +321,7 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 	default:
 		return 0, false, fmt.Errorf("StatObject for blob %q: %w", blobKey, err)
 	}
+	mu.Unlock()
 
 	statInfo, err = s.s3Client.StatObject(ctx, blobBucket, blobKey)
 	if err != nil {
