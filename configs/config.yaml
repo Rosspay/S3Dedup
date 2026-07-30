@@ -12,7 +12,7 @@ s3:
   - name: "next-bucket"
     prefix: "next-prefix/"
 dedup:
-  hash_algo: "sha256"
+  hash_algo: "sha512"
   min_size_bytes: 100 #
   blob_bucket: "blobs-bucket"
   blob_prefix: "blobs/"

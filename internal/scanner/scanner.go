@@ -104,6 +104,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 
 	defer func() {
 		scanReport.ScanFinished = time.Now().UTC()
+		fmt.Printf("Scan %s finished at %s in %f\n", scanID, scanReport.ScanFinished, time.Since(scanReport.ScanStarted).Seconds())
 		scanReport.ObjectsScanned = objectsScanned.Load()
 		scanReport.Errors += processErrors.Load()
 		scanReport.ObjectsRelinked = objectsRelinked.Load()
@@ -144,7 +145,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 			}
 		}()
 	}
-
+	fmt.Printf("Scan %s started at %s\n", scanID, scanReport.ScanStarted)
 	s.logging.Infof("Scan %s started at %s\n", scanID, scanReport.ScanStarted)
 	for _, bucket := range s.config.S3.Buckets {
 		err := s.s3Client.ListObjects(ctx, bucket.Name, bucket.Prefix, true,
@@ -193,6 +194,12 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 	}
 	close(jobs)
 	wg.Wait()
+
+	s.blobLocks.Range(func(key, _ any) bool {
+		s.blobLocks.Delete(key)
+		return true
+	})
+
 	for _, bucket := range s.config.S3.Buckets {
 		_, err := s.store.FinalizeScope(ctx, bucket.Name, bucket.Prefix, scanID)
 		if err != nil {
@@ -223,7 +230,6 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 	scanReport.UniqueBlobs = stats.UniqueBlobs
 	scanReport.DuplicatesFound = stats.DuplicatesFound
 	scanReport.BytesReclaimable = stats.BytesReclaimable + gcBytes
-
 	return scanReport, nil
 }
 
@@ -252,7 +258,7 @@ func (s *Scanner) processObject(ctx context.Context, bucket string,
 		return err
 	}
 
-	err = s.register(ctx, bucket, s.config.Dedup.BlobBucket, s.config.Dedup.BlobPrefix+s.config.Dedup.HashAlgo+"/"+hash, info, hash, info.Size, scanID, cache.ObjectStateReported)
+	err = s.register(ctx, bucket, s.config.Dedup.BlobBucket, s.config.Dedup.BlobPrefix+hash, info, hash, info.Size, scanID, cache.ObjectStateReported)
 	if err != nil {
 		return err
 	}
@@ -261,7 +267,7 @@ func (s *Scanner) processObject(ctx context.Context, bucket string,
 }
 
 func (s *Scanner) blobMutex(blobBucket, blobKey string) *sync.Mutex {
-	key := blobBucket + s.config.Dedup.HashAlgo + "/" + blobKey
+	key := blobBucket + blobKey
 	mu, _ := s.blobLocks.LoadOrStore(key, &sync.Mutex{})
 	return mu.(*sync.Mutex)
 }
@@ -299,7 +305,7 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 	logicalBucket := bucket
 	logicalKey := info.Key
 	blobBucket := s.config.Dedup.BlobBucket
-	blobKey := s.config.Dedup.BlobPrefix + s.config.Dedup.HashAlgo + "/" + hash
+	blobKey := s.config.Dedup.BlobPrefix + hash
 	mu := s.blobMutex(blobBucket, blobKey)
 
 	reclaimed, err := func() (int64, error) {
@@ -380,7 +386,7 @@ func (s *Scanner) processPointer(ctx context.Context, bucket string, info minio.
 	if err != nil {
 		return err
 	}
-	if p.BlobKey != s.config.Dedup.BlobPrefix+s.config.Dedup.HashAlgo+"/"+p.Hash {
+	if p.BlobKey != s.config.Dedup.BlobPrefix+p.Hash {
 		return fmt.Errorf("Pointer key %q does not match %q", p.BlobKey, s.config.Dedup.BlobPrefix+p.Hash)
 	}
 
@@ -403,7 +409,8 @@ func (s *Scanner) processPointer(ctx context.Context, bucket string, info minio.
 func (s *Scanner) safeReplace(ctx context.Context, bucket string, blobBucket string, info minio.ObjectInfo, hash string) (minio.ObjectInfo, error) {
 	p := pointer.Pointer{
 		BlobBucket:  blobBucket,
-		BlobKey:     s.config.Dedup.BlobPrefix + s.config.Dedup.HashAlgo + "/" + hash,
+		BlobKey:     s.config.Dedup.BlobPrefix + hash,
+		HashAlgo:    s.config.Dedup.HashAlgo,
 		Hash:        hash,
 		Size:        info.Size,
 		ContentType: info.ContentType,

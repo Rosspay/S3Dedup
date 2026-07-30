@@ -11,6 +11,7 @@ const ContentPointerType = ".json+pointer"
 type Pointer struct {
 	BlobBucket  string `json:"blob_bucket"`
 	BlobKey     string `json:"blob_key"`
+	HashAlgo    string `json:"hash_algo"`
 	Hash        string `json:"hash"`
 	Size        int64  `json:"size"`
 	ContentType string `json:"content_type,omitempty"`
