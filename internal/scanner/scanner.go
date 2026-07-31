@@ -162,7 +162,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 					return s.store.UnregisterObject(ctx, bucket.Name, info.Key)
 				}
 				objectsScanned.Add(1)
-				unchanged, state, err := s.store.GetObjectStatus(ctx, bucket.Name, info.Key, info.ETag, info.Size, info.LastModified)
+				unchanged, state, err := s.store.GetObjectStatus(ctx, bucket.Name, info.Key, info.ETag, info.Size, s.config.Dedup.HashAlgo, info.LastModified)
 				if err != nil {
 					s.logging.Errorf("GetObjectStatus %s/%s: %v", bucket.Name, info.Key, err)
 					scanReport.Errors++
@@ -258,7 +258,7 @@ func (s *Scanner) processObject(ctx context.Context, bucket string,
 		return err
 	}
 
-	err = s.register(ctx, bucket, s.config.Dedup.BlobBucket, s.config.Dedup.BlobPrefix+hash, info, hash, info.Size, scanID, cache.ObjectStateReported)
+	err = s.register(ctx, bucket, s.config.Dedup.BlobBucket, s.config.Dedup.BlobPrefix+hash, info, hash, s.config.Dedup.HashAlgo, info.Size, scanID, cache.ObjectStateReported)
 	if err != nil {
 		return err
 	}
@@ -306,40 +306,8 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 	logicalKey := info.Key
 	blobBucket := s.config.Dedup.BlobBucket
 	blobKey := s.config.Dedup.BlobPrefix + hash
-	mu := s.blobMutex(blobBucket, blobKey)
 
-	reclaimed, err := func() (int64, error) {
-		mu.Lock()
-		defer mu.Unlock()
-		statInfo, err := s.s3Client.StatObject(ctx, blobBucket, blobKey)
-		errCode := minio.ToErrorResponse(err).Code
-		var reclaimed int64
-		switch {
-		case err == nil:
-			if statInfo.Size != info.Size {
-				return 0, fmt.Errorf("Consistency error: Blob %q size mismatch", blobKey)
-			}
-		case errCode == "NoSuchKey":
-			if _, err := temp.Seek(0, io.SeekStart); err != nil {
-				return 0, err
-			}
-			n, err := s.s3Client.PutObject(ctx, blobBucket, blobKey, temp, info.Size, info.ContentType)
-			if err != nil {
-				return 0, err
-			}
-			if n != info.Size {
-				return 0, fmt.Errorf("Consistency for PutObject error: Blob %q size mismatch", blobKey)
-			}
-			reclaimed -= n
-			s.logging.Debugf("Blob %s of size %d was put\n", blobKey, n)
-			return reclaimed, nil
-		default:
-			return 0, fmt.Errorf("StatObject for blob %q: %w", blobKey, err)
-		}
-		return 0, nil
-	}()
-
-	_, err = s.s3Client.StatObject(ctx, blobBucket, blobKey)
+	reclaimed, err := s.createBlob(ctx, hash, temp, info.Size, info.ContentType)
 	if err != nil {
 		return 0, false, err
 	}
@@ -367,12 +335,55 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 	}
 
 	if !flagChanged {
-		err = s.register(ctx, logicalBucket, blobBucket, blobKey, res, hash, info.Size, scanID, state)
+		err = s.register(ctx, logicalBucket, blobBucket, blobKey, res, hash, s.config.Dedup.HashAlgo, info.Size, scanID, state)
 		if err != nil {
 			return 0, false, err
 		}
 	}
 	return info.Size - res.Size + reclaimed, relinked, nil
+}
+
+func (s *Scanner) createBlob(ctx context.Context, hash string, temp *os.File, size int64, contentType string) (int64, error) {
+	blobBucket := s.config.Dedup.BlobBucket
+	blobKey := s.config.Dedup.BlobPrefix + hash
+	mu := s.blobMutex(blobBucket, blobKey)
+
+	reclaimed, err := func() (int64, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		statInfo, err := s.s3Client.StatObject(ctx, blobBucket, blobKey)
+		errCode := minio.ToErrorResponse(err).Code
+		var reclaimed int64
+		switch {
+		case err == nil:
+			if statInfo.Size != size {
+				return 0, fmt.Errorf("Consistency error: Blob %q size mismatch", blobKey)
+			}
+		case errCode == "NoSuchKey":
+			if _, err := temp.Seek(0, io.SeekStart); err != nil {
+				return 0, err
+			}
+			n, err := s.s3Client.PutObject(ctx, blobBucket, blobKey, temp, size, contentType)
+			if err != nil {
+				return 0, err
+			}
+			if n != size {
+				return 0, fmt.Errorf("Consistency for PutObject error: Blob %q size mismatch", blobKey)
+			}
+			reclaimed -= n
+			s.logging.Debugf("Blob %s of size %d was put\n", blobKey, n)
+			return reclaimed, nil
+		default:
+			return 0, fmt.Errorf("StatObject for blob %q: %w", blobKey, err)
+		}
+		return 0, nil
+	}()
+
+	_, err = s.s3Client.StatObject(ctx, blobBucket, blobKey)
+	if err != nil {
+		return 0, err
+	}
+	return reclaimed, nil
 }
 
 func (s *Scanner) processPointer(ctx context.Context, bucket string, info minio.ObjectInfo, scanID string) error {
@@ -386,6 +397,13 @@ func (s *Scanner) processPointer(ctx context.Context, bucket string, info minio.
 	if err != nil {
 		return err
 	}
+	logicalInfo := info
+	if p.HashAlgo != s.config.Dedup.HashAlgo {
+		p, logicalInfo, err = s.migratePointerHash(ctx, bucket, info, p)
+		if err != nil {
+			return err
+		}
+	}
 	if p.BlobKey != s.config.Dedup.BlobPrefix+p.Hash {
 		return fmt.Errorf("Pointer key %q does not match %q", p.BlobKey, s.config.Dedup.BlobPrefix+p.Hash)
 	}
@@ -398,12 +416,71 @@ func (s *Scanner) processPointer(ctx context.Context, bucket string, info minio.
 		return fmt.Errorf("%q/%q: Pointer-object mismatch", bucket, info.Key)
 	}
 
-	err = s.register(ctx, bucket, p.BlobBucket, p.BlobKey, info, p.Hash, p.Size, scanID, cache.ObjectStatePointer)
+	err = s.register(ctx, bucket, p.BlobBucket, p.BlobKey, logicalInfo, p.Hash, p.HashAlgo, p.Size, scanID, cache.ObjectStatePointer)
 	if err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func (s *Scanner) migratePointerHash(ctx context.Context, bucket string, info minio.ObjectInfo, p *pointer.Pointer) (*pointer.Pointer, minio.ObjectInfo, error) {
+	obj, err := s.s3Client.GetObject(ctx, p.BlobBucket, p.BlobKey)
+	if err != nil {
+		return nil, minio.ObjectInfo{}, err
+	}
+	defer obj.Close()
+
+	temp, err := os.CreateTemp("", "s3-dedup-*")
+	if err != nil {
+		return nil, minio.ObjectInfo{}, err
+	}
+	defer func() {
+		temp.Close()
+		os.Remove(temp.Name())
+	}()
+
+	tee := io.TeeReader(obj, temp)
+	hash, err := hashing.HashReader(tee, s.config.Dedup.HashAlgo)
+	if err != nil {
+		return nil, minio.ObjectInfo{}, err
+	}
+
+	_, err = s.createBlob(ctx, hash, temp, p.Size, p.ContentType)
+	if err != nil {
+		return nil, minio.ObjectInfo{}, err
+	}
+
+	p.BlobKey = s.config.Dedup.BlobPrefix + hash
+	p.Hash = hash
+	p.HashAlgo = s.config.Dedup.HashAlgo
+	p.BlobBucket = s.config.Dedup.BlobBucket
+
+	data, err := pointer.WritePointer(*p)
+	if err != nil {
+		return nil, minio.ObjectInfo{}, fmt.Errorf("safeDelete %q/%q: %w", bucket, info.Key, err)
+	}
+
+	n, err := s.s3Client.PutObject(ctx, bucket, info.Key, bytes.NewReader(data), int64(len(data)), pointer.ContentPointerType)
+	if err != nil {
+		return nil, minio.ObjectInfo{}, fmt.Errorf("safeDelete %q/%q: %w", bucket, info.Key, err)
+	}
+	if n != int64(len(data)) {
+		return nil, minio.ObjectInfo{}, fmt.Errorf("safeDelete %q/%q: PutObject size mismatch", bucket, info.Key)
+	}
+
+	pInfo, err := s.s3Client.StatObject(ctx, bucket, info.Key)
+	if err != nil {
+		return nil, minio.ObjectInfo{}, fmt.Errorf("safeDelete %q/%q: %w", bucket, info.Key, err)
+	}
+	if pInfo.Size != int64(len(data)) {
+		return nil, minio.ObjectInfo{}, fmt.Errorf("safeDelete %q/%q: object put has different size", bucket, info.Key)
+	}
+	if pInfo.ContentType != pointer.ContentPointerType {
+		return nil, minio.ObjectInfo{}, fmt.Errorf("safeDelete %q/%q: object put ContentType must be %q", bucket, info.Key, pointer.ContentPointerType)
+	}
+
+	return p, pInfo, nil
 }
 
 func (s *Scanner) safeReplace(ctx context.Context, bucket string, blobBucket string, info minio.ObjectInfo, hash string) (minio.ObjectInfo, error) {
@@ -545,6 +622,7 @@ func (s *Scanner) register(
 	blobKey string,
 	info minio.ObjectInfo,
 	hash string,
+	hashAlgo string,
 	blobSize int64,
 	scanID string,
 	state cache.ObjectState,
@@ -559,6 +637,7 @@ func (s *Scanner) register(
 		BlobSize:     blobSize,
 		LastModified: info.LastModified,
 		Hash:         hash,
+		HashAlgo:     hashAlgo,
 		LastSeenScan: scanID,
 		State:        state,
 	}

@@ -15,6 +15,7 @@ type Store interface {
 		key string,
 		etag string,
 		size int64,
+		hashAlgo string,
 		lastModified time.Time,
 	) (unchanged bool, state ObjectState, err error)
 	GetStats(ctx context.Context) (Stats, error)
@@ -43,6 +44,7 @@ type ObjectRecord struct {
 	BlobSize     int64
 	LastModified time.Time
 	Hash         string
+	HashAlgo     string
 	LastSeenScan string
 	State        ObjectState
 }

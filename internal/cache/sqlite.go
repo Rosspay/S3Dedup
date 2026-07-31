@@ -69,6 +69,7 @@ func (s *SQLiteStore) initialize(ctx context.Context) error {
 			last_modified TEXT NOT NULL,
 			blob_bucket TEXT NOT NULL,
 			blob_hash TEXT NOT NULL,
+			hash_algo TEXT NOT NULL,
 			last_seen_scan TEXT NOT NULL,
 			object_state TEXT NOT NULL CHECK (object_state = "reported" OR object_state = "blob_ready" OR object_state = "pointer"),
 			PRIMARY KEY (bucket, object_key),
@@ -111,8 +112,8 @@ func (s *SQLiteStore) RegisterObject(ctx context.Context, object ObjectRecord) e
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO objects (
-				bucket, object_key, etag, size, last_modified, blob_bucket, blob_hash, last_seen_scan, object_state
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+				bucket, object_key, etag, size, last_modified, blob_bucket, blob_hash, hash_algo, last_seen_scan, object_state
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`,
 			object.Bucket,
 			object.Key,
@@ -121,6 +122,7 @@ func (s *SQLiteStore) RegisterObject(ctx context.Context, object ObjectRecord) e
 			object.LastModified.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"),
 			object.BlobBucket,
 			object.Hash,
+			object.HashAlgo,
 			object.LastSeenScan,
 			object.State,
 		); err != nil {
@@ -131,7 +133,7 @@ func (s *SQLiteStore) RegisterObject(ctx context.Context, object ObjectRecord) e
 	case oldBlobBucket == object.BlobBucket && oldHash == object.Hash:
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE objects
-			SET etag = ?, size = ?, last_modified = ?, last_seen_scan = ?, object_state = ?
+			SET etag = ?, size = ?, last_modified = ?, last_seen_scan = ?, object_state = ?, hash_algo
 			WHERE bucket = ? AND object_key = ?
 		`,
 			object.ETag,
@@ -139,6 +141,7 @@ func (s *SQLiteStore) RegisterObject(ctx context.Context, object ObjectRecord) e
 			object.LastModified.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"),
 			object.LastSeenScan,
 			object.State,
+			object.HashAlgo,
 			object.Bucket,
 			object.Key,
 		); err != nil {
@@ -153,7 +156,7 @@ func (s *SQLiteStore) RegisterObject(ctx context.Context, object ObjectRecord) e
 		}
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE objects
-			SET etag = ?, size = ?, last_modified = ?, blob_bucket = ?, blob_hash = ?, last_seen_scan = ?, object_state = ?
+			SET etag = ?, size = ?, last_modified = ?, blob_bucket = ?, blob_hash = ?, last_seen_scan = ?, object_state = ?, hash_algo = ?
 			WHERE bucket = ? AND object_key = ?
 		`,
 			object.ETag,
@@ -163,6 +166,7 @@ func (s *SQLiteStore) RegisterObject(ctx context.Context, object ObjectRecord) e
 			object.Hash,
 			object.LastSeenScan,
 			object.State,
+			object.HashAlgo,
 			object.Bucket,
 			object.Key,
 		); err != nil {
@@ -217,40 +221,13 @@ func (s *SQLiteStore) UnregisterObject(
 	return nil
 }
 
-// func (s *SQLiteStore) IsObjectUnchanged(
-// 	ctx context.Context,
-// 	bucket string,
-// 	key string,
-// 	etag string,
-// 	size int64,
-// 	lastModified time.Time,
-// ) (bool, bool, error) {
-// 	const query = `
-// 	SELECT is_pointer FROM objects
-// 	WHERE bucket = ?
-// 	AND object_key = ?
-// 	AND etag = ?
-// 	AND size = ?
-// 	AND last_modified = ?
-// 	`
-
-// 	var isPointer bool
-// 	err := s.db.QueryRowContext(ctx, query, bucket, key, etag, size, lastModified.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")).Scan(&isPointer)
-// 	switch {
-// 	case errors.Is(err, sql.ErrNoRows):
-// 		return false, isPointer, nil
-// 	case err != nil:
-// 		return false, isPointer, fmt.Errorf("check object %q/%q: %w", bucket, key, err)
-// 	}
-// 	return true, isPointer, nil
-// }
-
 func (s *SQLiteStore) GetObjectStatus(
 	ctx context.Context,
 	bucket string,
 	key string,
 	etag string,
 	size int64,
+	hashAlgo string,
 	lastModified time.Time,
 ) (unchanged bool, state ObjectState, err error) {
 	const query = `
@@ -259,9 +236,10 @@ func (s *SQLiteStore) GetObjectStatus(
 	AND object_key = ? 
 	AND etag = ?
 	AND size = ?
+	AND hash_algo = ?
 	AND last_modified = ?
 	`
-	err = s.db.QueryRowContext(ctx, query, bucket, key, etag, size, lastModified.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")).Scan(&state)
+	err = s.db.QueryRowContext(ctx, query, bucket, key, etag, size, hashAlgo, lastModified.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")).Scan(&state)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return false, "", nil
@@ -289,6 +267,8 @@ func validateObject(object ObjectRecord) error {
 		return fmt.Errorf("register object %q/%q: hash is empty", object.Bucket, object.Key)
 	case object.Size < 0:
 		return fmt.Errorf("register object %q/%q: size is negative", object.Bucket, object.Key)
+	case object.HashAlgo == "":
+		return fmt.Errorf("register object %q/%q: hash_algo is empty", object.Bucket, object.Key)
 	default:
 		return nil
 	}
