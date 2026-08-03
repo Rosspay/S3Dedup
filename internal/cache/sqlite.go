@@ -133,7 +133,7 @@ func (s *SQLiteStore) RegisterObject(ctx context.Context, object ObjectRecord) e
 	case oldBlobBucket == object.BlobBucket && oldHash == object.Hash:
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE objects
-			SET etag = ?, size = ?, last_modified = ?, last_seen_scan = ?, object_state = ?, hash_algo
+			SET etag = ?, size = ?, last_modified = ?, last_seen_scan = ?, object_state = ?, hash_algo = ?
 			WHERE bucket = ? AND object_key = ?
 		`,
 			object.ETag,
@@ -229,26 +229,31 @@ func (s *SQLiteStore) GetObjectStatus(
 	size int64,
 	hashAlgo string,
 	lastModified time.Time,
-) (unchanged bool, state ObjectState, err error) {
+) (status ObjectStatus, err error) {
 	const query = `
-	SELECT object_state FROM objects
-	WHERE bucket = ?
-	AND object_key = ? 
-	AND etag = ?
-	AND size = ?
-	AND hash_algo = ?
-	AND last_modified = ?
+	SELECT o.object_state, b.ref_count 
+	FROM objects AS o
+	JOIN blobs AS b
+	ON b.bucket = o.blob_bucket
+	AND b.hash = o.blob_hash
+	WHERE o.bucket = ?
+	AND o.object_key = ? 
+	AND o.etag = ?
+	AND o.size = ?
+	AND o.hash_algo = ?
+	AND o.last_modified = ?
 	`
-	err = s.db.QueryRowContext(ctx, query, bucket, key, etag, size, hashAlgo, lastModified.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")).Scan(&state)
+	err = s.db.QueryRowContext(ctx, query, bucket, key, etag, size, hashAlgo, lastModified.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")).Scan(&status.State, &status.RefCount)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		return false, "", nil
+		return ObjectStatus{}, nil
 	case err != nil:
-		return false, "", fmt.Errorf("GetObjectStatus %q/%q: %w", bucket, key, err)
-	case state == "":
-		return false, "", fmt.Errorf("GetObjectsStatus %q/%q: undefined object_state in cache", bucket, key)
+		return ObjectStatus{}, fmt.Errorf("GetObjectStatus %q/%q: %w", bucket, key, err)
+	case status.State == "":
+		return ObjectStatus{}, fmt.Errorf("GetObjectsStatus %q/%q: undefined object_state in cache", bucket, key)
 	}
-	return true, state, nil
+	status.Unchanged = true
+	return status, nil
 }
 
 func validateObject(object ObjectRecord) error {
@@ -345,16 +350,38 @@ func decrementBlob(ctx context.Context, tx *sql.Tx, bucket string, hash string) 
 // Getting required stats for report
 func (s *SQLiteStore) GetStats(ctx context.Context) (Stats, error) {
 	const query = `
-		SELECT
-			COUNT(*),
-			COALESCE(SUM(CASE WHEN object_count > 1 THEN object_count - 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN object_count > 1 THEN (object_count - 1) * size ELSE 0 END), 0)
-		FROM (
-			SELECT o.blob_bucket, o.blob_hash, COUNT(*) AS object_count, b.size AS size
+		WITH groups AS (
+			SELECT
+				o.blob_bucket,
+				o.blob_hash,
+				b.size,
+				COUNT(*) AS object_count,
+				SUM(CASE
+					WHEN o.object_state <> 'pointer' THEN 1
+					ELSE 0
+				END) AS original_count,
+				SUM(CASE
+					WHEN o.object_state IN ('blob_ready', 'pointer') THEN 1
+					ELSE 0
+				END) AS materialized_count
 			FROM objects AS o
-			JOIN blobs AS b ON b.bucket = o.blob_bucket AND b.hash = o.blob_hash
+			JOIN blobs AS b
+			ON b.bucket = o.blob_bucket
+			AND b.hash = o.blob_hash
 			GROUP BY o.blob_bucket, o.blob_hash, b.size
 		)
+		SELECT
+			COUNT(*),
+			COALESCE(SUM(CASE
+				WHEN object_count > 1 THEN object_count - 1
+				ELSE 0
+			END), 0),
+			COALESCE(SUM(CASE
+				WHEN object_count <= 1 OR original_count = 0 THEN 0
+				WHEN materialized_count > 0 THEN original_count * size
+				ELSE (original_count - 1) * size
+			END), 0)
+		FROM groups
 	`
 	var stats Stats
 	if err := s.db.QueryRowContext(ctx, query).Scan(

@@ -12,12 +12,12 @@ s3:
   #- name: "next-bucket"
   #  prefix: "next-prefix/"
 dedup:
-  hash_algo: "sha512"
+  hash_algo: "sha256"
   min_size_bytes: 100 #
   blob_bucket: "blobs-bucket"
   blob_prefix: "blobs/"
-  mode: "pointer" # report_only | pointer
-  delete_originals: true # :
+  mode: "report_only" # report_only | pointer
+  delete_originals: false # :
 cache:
   backend: "sqlite" # sqlite | leveldb
   path: "state.db"

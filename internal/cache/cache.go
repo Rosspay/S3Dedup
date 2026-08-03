@@ -17,7 +17,7 @@ type Store interface {
 		size int64,
 		hashAlgo string,
 		lastModified time.Time,
-	) (unchanged bool, state ObjectState, err error)
+	) (status ObjectStatus, err error)
 	GetStats(ctx context.Context) (Stats, error)
 	MarkObjectSeen(ctx context.Context, bucket, key, scanID string) error
 	FinalizeScope(ctx context.Context, bucket, prefix, scanID string) (removed int64, err error)
@@ -47,6 +47,12 @@ type ObjectRecord struct {
 	HashAlgo     string
 	LastSeenScan string
 	State        ObjectState
+}
+
+type ObjectStatus struct {
+	Unchanged bool
+	State     ObjectState
+	RefCount  int64
 }
 
 type BlobRecord struct {
