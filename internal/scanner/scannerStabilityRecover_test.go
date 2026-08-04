@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"s3-dedup/internal/cache"
-	"s3-dedup/internal/config"
 	"s3-dedup/internal/pointer"
 	"strconv"
 	"sync"
@@ -18,13 +17,17 @@ type failRegisterStore struct {
 	cache.Store
 	mu        sync.Mutex
 	remaining int
+	state     cache.ObjectState
+	key       string
 	err       error
 }
 
 func (s *failRegisterStore) RegisterObject(ctx context.Context, object cache.ObjectRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.remaining > 0 {
+	if s.remaining > 0 &&
+		(s.state == "" || object.State == s.state) &&
+		(s.key == "" || object.Key == s.key) {
 		s.remaining--
 		return s.err
 	}
@@ -32,7 +35,8 @@ func (s *failRegisterStore) RegisterObject(ctx context.Context, object cache.Obj
 }
 
 func TestPointerModePointerSurvivesCacheFailureAndRestoresReference(t *testing.T) {
-	const key = "original.txt"
+	const firstKey = "original-one.txt"
+	const secondKey = "original-two.txt"
 	const content = "pointer must restore a missing cache reference"
 
 	ctx := context.Background()
@@ -40,14 +44,20 @@ func TestPointerModePointerSurvivesCacheFailureAndRestoresReference(t *testing.T
 	cfg := pointerTestConfig()
 	cfg.Dedup.DeleteOriginals = true
 	client := &mockS3Client{
-		objects: []minio.ObjectInfo{objectInfo(key, int64(len(content)))},
+		objects: []minio.ObjectInfo{
+			objectInfo(firstKey, int64(len(content))),
+			objectInfo(secondKey, int64(len(content))),
+		},
 		contents: map[string]string{
-			objectID("bucket", key): content,
+			objectID("bucket", firstKey):  content,
+			objectID("bucket", secondKey): content,
 		},
 	}
 	failingStore := &failRegisterStore{
 		Store:     store,
 		remaining: 1,
+		state:     cache.ObjectStatePointer,
+		key:       firstKey,
 		err:       errors.New("simulated cache commit error"),
 	}
 
@@ -58,21 +68,22 @@ func TestPointerModePointerSurvivesCacheFailureAndRestoresReference(t *testing.T
 	if firstResult.Errors != 1 {
 		t.Errorf("first Errors = %d, expected 1", firstResult.Errors)
 	}
-	pointerID := objectID("bucket", key)
-	if got := client.stats[pointerID].ContentType; got != pointer.ContentPointerType {
-		t.Fatalf("object ContentType after cache failure = %q, expected %q", got, pointer.ContentPointerType)
+	for _, key := range []string{firstKey, secondKey} {
+		if got := client.stats[objectID("bucket", key)].ContentType; got != pointer.ContentPointerType {
+			t.Fatalf("object %q ContentType after cache failure = %q, expected %q", key, got, pointer.ContentPointerType)
+		}
 	}
 	firstPutCalls := client.totalPutCalls()
-	if firstPutCalls != 2 {
-		t.Errorf("first PutObject calls = %d, expected 2", firstPutCalls)
+	if firstPutCalls != 3 {
+		t.Errorf("first PutObject calls = %d, expected 3", firstPutCalls)
 	}
 
 	stats, err := store.GetStats(ctx)
 	if err != nil {
 		t.Fatalf("GetStats after cache failure: %v", err)
 	}
-	if stats.UniqueBlobs != 0 || stats.DuplicatesFound != 0 || stats.BytesReclaimable != 0 {
-		t.Errorf("cache changed despite RegisterObject failure: %+v", stats)
+	if stats.UniqueBlobs != 1 || stats.DuplicatesFound != 1 || stats.BytesReclaimable != int64(len(content)) {
+		t.Errorf("cache state after RegisterObject failure = %+v", stats)
 	}
 
 	secondResult, err := newTestScanner(t, client, store, cfg).ScanOnce(ctx)
@@ -93,15 +104,14 @@ func TestPointerModePointerSurvivesCacheFailureAndRestoresReference(t *testing.T
 	if err != nil {
 		t.Fatalf("GetStats after recovery: %v", err)
 	}
-	if stats.UniqueBlobs != 1 || stats.DuplicatesFound != 0 {
+	if stats.UniqueBlobs != 1 || stats.DuplicatesFound != 1 || stats.BytesReclaimable != 0 {
 		t.Errorf("cache reference was not restored: %+v", stats)
 	}
 }
 
 func TestCollectGarbageKeepsFailedBlobAndDeletesSuccessfulBlob(t *testing.T) {
 	const (
-		firstBucket   = "bucket-a"
-		secondBucket  = "bucket-b"
+		blobBucket    = "blob-bucket"
 		firstKey      = "blobs/hash-a"
 		secondKey     = "blobs/hash-b"
 		firstHash     = "hash-a"
@@ -112,9 +122,11 @@ func TestCollectGarbageKeepsFailedBlobAndDeletesSuccessfulBlob(t *testing.T) {
 
 	ctx := context.Background()
 	store := openTestStore(t)
-	firstRecord := record(firstBucket, "source-a.txt", firstHash, int64(len(firstContent)))
+	firstRecord := record("source-bucket", "source-a.txt", firstHash, int64(len(firstContent)))
+	firstRecord.BlobBucket = blobBucket
 	firstRecord.BlobKey = firstKey
-	secondRecord := record(secondBucket, "source-b.txt", secondHash, int64(len(secondContent)))
+	secondRecord := record("source-bucket", "source-b.txt", secondHash, int64(len(secondContent)))
+	secondRecord.BlobBucket = blobBucket
 	secondRecord.BlobKey = secondKey
 	for _, object := range []cache.ObjectRecord{firstRecord, secondRecord} {
 		if err := store.RegisterObject(ctx, object); err != nil {
@@ -127,20 +139,17 @@ func TestCollectGarbageKeepsFailedBlobAndDeletesSuccessfulBlob(t *testing.T) {
 
 	client := &mockS3Client{
 		contents: map[string]string{
-			objectID(firstBucket, firstKey):   firstContent,
-			objectID(secondBucket, secondKey): secondContent,
+			objectID(blobBucket, firstKey):  firstContent,
+			objectID(blobBucket, secondKey): secondContent,
 		},
 		removeErrs: map[string]map[string]error{
-			secondBucket: {
+			blobBucket: {
 				secondKey: errors.New("simulated S3 delete error"),
 			},
 		},
 	}
 	cfg := pointerTestConfig()
-	cfg.S3.Buckets = []config.Bucket{
-		{Name: firstBucket},
-		{Name: secondBucket},
-	}
+	cfg.Dedup.BlobBucket = blobBucket
 
 	bytesReclaimed, blobsRemoved, err := newTestScanner(t, client, store, cfg).collectGarbage(ctx)
 	if err == nil {
@@ -152,37 +161,26 @@ func TestCollectGarbageKeepsFailedBlobAndDeletesSuccessfulBlob(t *testing.T) {
 	if blobsRemoved != 1 {
 		t.Errorf("blobsRemoved = %d, expected 1", blobsRemoved)
 	}
-	if got := client.content(objectID(firstBucket, firstKey)); got != "" {
+	if got := client.content(objectID(blobBucket, firstKey)); got != "" {
 		t.Errorf("successfully deleted blob still exists: %q", got)
 	}
-	if got := client.content(objectID(secondBucket, secondKey)); got != secondContent {
+	if got := client.content(objectID(blobBucket, secondKey)); got != secondContent {
 		t.Errorf("failed blob content = %q, expected %q", got, secondContent)
 	}
 
-	firstBlobs, err := store.ListUnreferencedBlobs(ctx, firstBucket)
+	blobs, err := store.ListUnreferencedBlobs(ctx, blobBucket)
 	if err != nil {
-		t.Fatalf("ListUnreferencedBlobs first bucket: %v", err)
+		t.Fatalf("ListUnreferencedBlobs: %v", err)
 	}
-	if len(firstBlobs) != 0 {
-		t.Errorf("first bucket has %d unreferenced blobs, expected 0", len(firstBlobs))
-	}
-	secondBlobs, err := store.ListUnreferencedBlobs(ctx, secondBucket)
-	if err != nil {
-		t.Fatalf("ListUnreferencedBlobs second bucket: %v", err)
-	}
-	if len(secondBlobs) != 1 || secondBlobs[0].Key != secondKey {
-		t.Errorf("second bucket unreferenced blobs = %+v, expected only %q", secondBlobs, secondKey)
+	if len(blobs) != 1 || blobs[0].Key != secondKey {
+		t.Errorf("unreferenced blobs = %+v, expected only %q", blobs, secondKey)
 	}
 
 	client.mu.RLock()
-	firstCalls := append([][]string(nil), client.removeCalls[firstBucket]...)
-	secondCalls := append([][]string(nil), client.removeCalls[secondBucket]...)
+	calls := append([][]string(nil), client.removeCalls[blobBucket]...)
 	client.mu.RUnlock()
-	if len(firstCalls) != 1 || len(firstCalls[0]) != 1 || firstCalls[0][0] != firstKey {
-		t.Errorf("RemoveObjects calls for first bucket = %v", firstCalls)
-	}
-	if len(secondCalls) != 1 || len(secondCalls[0]) != 1 || secondCalls[0][0] != secondKey {
-		t.Errorf("RemoveObjects calls for second bucket = %v", secondCalls)
+	if len(calls) != 1 || len(calls[0]) != 2 {
+		t.Errorf("RemoveObjects calls for blob bucket = %v", calls)
 	}
 }
 
@@ -359,21 +357,25 @@ func TestScanOnceNoObjectLostWithError(t *testing.T) {
 		t.Errorf("Errors = %d, expected %d", res.Errors, expErrors)
 	}
 }
-func TestPointerModeUploadErrorKeepsOriginalAndDoesNotRegister(t *testing.T) {
+func TestPointerModeUploadErrorKeepsOriginalsInReportedState(t *testing.T) {
 	const content = "must remain untouched"
-	const key = "original.txt"
+	const firstKey = "original-one.txt"
+	const secondKey = "original-two.txt"
 
 	store := openTestStore(t)
 	cfg := pointerTestConfig()
 	blobKey := cfg.Dedup.BlobPrefix + hashContent(t, content)
-	putErr := errors.New("simulated blob upload error")
 	client := &mockS3Client{
-		objects: []minio.ObjectInfo{objectInfo(key, int64(len(content)))},
+		objects: []minio.ObjectInfo{
+			objectInfo(firstKey, int64(len(content))),
+			objectInfo(secondKey, int64(len(content))),
+		},
 		contents: map[string]string{
-			objectID("bucket", key): content,
+			objectID("bucket", firstKey):  content,
+			objectID("bucket", secondKey): content,
 		},
 		putErrors: map[string]error{
-			objectID("bucket", blobKey): putErr,
+			objectID("bucket", blobKey): errors.New("simulated blob upload error"),
 		},
 	}
 
@@ -381,11 +383,13 @@ func TestPointerModeUploadErrorKeepsOriginalAndDoesNotRegister(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ScanOnce error: %v", err)
 	}
-	if result.Errors != 1 {
-		t.Errorf("Errors = %d, expected 1", result.Errors)
+	if result.Errors != 2 {
+		t.Errorf("Errors = %d, expected 2", result.Errors)
 	}
-	if got := client.content(objectID("bucket", key)); got != content {
-		t.Errorf("original content = %q, expected %q", got, content)
+	for _, key := range []string{firstKey, secondKey} {
+		if got := client.content(objectID("bucket", key)); got != content {
+			t.Errorf("original %q content = %q, expected %q", key, got, content)
+		}
 	}
 	if got := client.content(objectID("bucket", blobKey)); got != "" {
 		t.Errorf("failed blob upload left content %q", got)
@@ -394,8 +398,8 @@ func TestPointerModeUploadErrorKeepsOriginalAndDoesNotRegister(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetStats error: %v", err)
 	}
-	if stats.UniqueBlobs != 0 || stats.DuplicatesFound != 0 || stats.BytesReclaimable != 0 {
-		t.Errorf("cache was changed after failed upload: %+v", stats)
+	if stats.UniqueBlobs != 1 || stats.DuplicatesFound != 1 || stats.BytesReclaimable != int64(len(content)) {
+		t.Errorf("cache after failed upload = %+v", stats)
 	}
 }
 func TestPointerModeExistingPointersRestoreCacheWithoutCreatingBlob(t *testing.T) {
@@ -431,8 +435,8 @@ func TestPointerModeExistingPointersRestoreCacheWithoutCreatingBlob(t *testing.T
 	if result.UniqueBlobs != 1 || result.DuplicatesFound != 1 {
 		t.Errorf("stats = unique %d, duplicates %d; expected 1 and 1", result.UniqueBlobs, result.DuplicatesFound)
 	}
-	if result.BytesReclaimable != int64(len(blobContent)) {
-		t.Errorf("BytesReclaimable = %d, expected %d", result.BytesReclaimable, len(blobContent))
+	if result.BytesReclaimable != 0 {
+		t.Errorf("BytesReclaimable = %d, expected 0", result.BytesReclaimable)
 	}
 	if got := client.totalPutCalls(); got != 0 {
 		t.Errorf("total PutObject calls = %d, expected 0", got)
@@ -445,36 +449,40 @@ func TestPointerModeExistingPointersRestoreCacheWithoutCreatingBlob(t *testing.T
 	if err != nil {
 		t.Fatalf("GetStats after probe error: %v", err)
 	}
-	if stats.UniqueBlobs != 1 || stats.DuplicatesFound != 2 || stats.BytesReclaimable != 2*int64(len(blobContent)) {
+	if stats.UniqueBlobs != 1 || stats.DuplicatesFound != 2 || stats.BytesReclaimable != int64(len(blobContent)) {
 		t.Errorf("pointer hash or refcount was not restored correctly: %+v", stats)
 	}
 }
-func TestPointerModeChangedObjectAfterListingIsNotReplaced(t *testing.T) {
-	const key = "document.txt"
+func TestPointerModeChangedObjectDuringProcessingIsNotReplaced(t *testing.T) {
+	const firstKey = "document-one.txt"
+	const secondKey = "document-two.txt"
 	const originalContent = "old-data"
 	const changedContent = "new-data"
 
 	store := openTestStore(t)
-	listedInfo := objectInfo(key, int64(len(originalContent)))
+	firstInfo := objectInfo(firstKey, int64(len(originalContent)))
+	secondInfo := objectInfo(secondKey, int64(len(originalContent)))
 	client := &mockS3Client{
-		objects: []minio.ObjectInfo{listedInfo},
+		objects: []minio.ObjectInfo{firstInfo, secondInfo},
 		contents: map[string]string{
-			objectID("bucket", key): originalContent,
+			objectID("bucket", firstKey):  originalContent,
+			objectID("bucket", secondKey): originalContent,
 		},
 		stats: map[string]minio.ObjectInfo{
-			objectID("bucket", key): listedInfo,
+			objectID("bucket", firstKey):  firstInfo,
+			objectID("bucket", secondKey): secondInfo,
 		},
 	}
 	client.statHooks = map[string]func(*mockS3Client, int){
-		objectID("bucket", key): func(m *mockS3Client, call int) {
-			if call != 2 {
+		objectID("bucket", firstKey): func(m *mockS3Client, call int) {
+			if call != 3 {
 				return
 			}
-			changedInfo := listedInfo
+			changedInfo := firstInfo
 			changedInfo.ETag = "etag-changed"
-			changedInfo.LastModified = listedInfo.LastModified.Add(time.Second)
-			m.contents[objectID("bucket", key)] = changedContent
-			m.stats[objectID("bucket", key)] = changedInfo
+			changedInfo.LastModified = firstInfo.LastModified.Add(time.Second)
+			m.contents[objectID("bucket", firstKey)] = changedContent
+			m.stats[objectID("bucket", firstKey)] = changedInfo
 		},
 	}
 	cfg := pointerTestConfig()
@@ -484,28 +492,32 @@ func TestPointerModeChangedObjectAfterListingIsNotReplaced(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ScanOnce error: %v", err)
 	}
-	if got := client.content(objectID("bucket", key)); got != changedContent {
+	if result.Errors != 0 {
+		t.Errorf("Errors = %d, expected 0", result.Errors)
+	}
+	if got := client.content(objectID("bucket", firstKey)); got != changedContent {
 		t.Errorf("changed object content = %q, expected %q", got, changedContent)
 	}
-	if got := client.putCallCount("bucket", key); got != 0 {
-		t.Errorf("pointer PutObject calls = %d, expected 0", got)
+	if got := client.putCallCount("bucket", firstKey); got != 0 {
+		t.Errorf("changed object pointer PutObject calls = %d, expected 0", got)
 	}
-	if result.ObjectsRelinked != 0 {
-		t.Errorf("ObjectsRelinked = %d, expected 0", result.ObjectsRelinked)
+	if got := client.stats[objectID("bucket", secondKey)].ContentType; got != pointer.ContentPointerType {
+		t.Errorf("unchanged duplicate ContentType = %q, expected %q", got, pointer.ContentPointerType)
 	}
-	if result.BytesReclaimed != 0 {
-		t.Errorf("BytesReclaimed = %d, expected 0", result.BytesReclaimed)
+	if result.ObjectsRelinked != 1 {
+		t.Errorf("ObjectsRelinked = %d, expected 1", result.ObjectsRelinked)
 	}
 	stats, err := store.GetStats(context.Background())
 	if err != nil {
 		t.Fatalf("GetStats error: %v", err)
 	}
-	if stats.UniqueBlobs != 0 || stats.DuplicatesFound != 0 || stats.BytesReclaimable != 0 {
-		t.Errorf("changed object was registered with stale metadata: %+v", stats)
+	if stats.UniqueBlobs != 1 || stats.DuplicatesFound != 1 || stats.BytesReclaimable != int64(len(originalContent)) {
+		t.Errorf("cache after changed object = %+v", stats)
 	}
 }
 func TestPointerModeCreatedBlobSurvivesPointerWriteFailureAndIsReused(t *testing.T) {
-	const key = "original.txt"
+	const firstKey = "original-one.txt"
+	const secondKey = "original-two.txt"
 	const content = "blob must be reused after pointer failure"
 
 	store := openTestStore(t)
@@ -513,14 +525,19 @@ func TestPointerModeCreatedBlobSurvivesPointerWriteFailureAndIsReused(t *testing
 	cfg.Dedup.DeleteOriginals = true
 	hash := hashContent(t, content)
 	blobKey := cfg.Dedup.BlobPrefix + hash
-	pointerID := objectID("bucket", key)
+	firstPointerID := objectID("bucket", firstKey)
+	secondPointerID := objectID("bucket", secondKey)
 	client := &mockS3Client{
-		objects: []minio.ObjectInfo{objectInfo(key, int64(len(content)))},
+		objects: []minio.ObjectInfo{
+			objectInfo(firstKey, int64(len(content))),
+			objectInfo(secondKey, int64(len(content))),
+		},
 		contents: map[string]string{
-			pointerID: content,
+			firstPointerID:  content,
+			secondPointerID: content,
 		},
 		putErrors: map[string]error{
-			pointerID: errors.New("simulated pointer upload error"),
+			firstPointerID: errors.New("simulated pointer upload error"),
 		},
 	}
 	scanner := newTestScanner(t, client, store, cfg)
@@ -532,8 +549,11 @@ func TestPointerModeCreatedBlobSurvivesPointerWriteFailureAndIsReused(t *testing
 	if firstResult.Errors != 1 {
 		t.Errorf("first Errors = %d, expected 1", firstResult.Errors)
 	}
-	if got := client.content(pointerID); got != content {
+	if got := client.content(firstPointerID); got != content {
 		t.Errorf("original content after pointer failure = %q, expected %q", got, content)
+	}
+	if got := client.stats[secondPointerID].ContentType; got != pointer.ContentPointerType {
+		t.Errorf("second object ContentType = %q, expected %q", got, pointer.ContentPointerType)
 	}
 	if got := client.content(objectID("bucket", blobKey)); got != content {
 		t.Errorf("created blob content = %q, expected %q", got, content)
@@ -545,11 +565,11 @@ func TestPointerModeCreatedBlobSurvivesPointerWriteFailureAndIsReused(t *testing
 	if err != nil {
 		t.Fatalf("GetStats after failed scan: %v", err)
 	}
-	if stats.UniqueBlobs != 0 || stats.DuplicatesFound != 0 || stats.BytesReclaimable != 0 {
-		t.Errorf("cache changed after pointer failure: %+v", stats)
+	if stats.UniqueBlobs != 1 || stats.DuplicatesFound != 1 || stats.BytesReclaimable != int64(len(content)) {
+		t.Errorf("cache after pointer failure = %+v", stats)
 	}
 
-	delete(client.putErrors, pointerID)
+	delete(client.putErrors, firstPointerID)
 	secondResult, err := scanner.ScanOnce(context.Background())
 	if err != nil {
 		t.Fatalf("second ScanOnce error: %v", err)
@@ -563,14 +583,14 @@ func TestPointerModeCreatedBlobSurvivesPointerWriteFailureAndIsReused(t *testing
 	if got := client.putCallCount("bucket", blobKey); got != 1 {
 		t.Errorf("blob was uploaded again: PutObject calls = %d, expected 1", got)
 	}
-	if got := client.stats[pointerID].ContentType; got != pointer.ContentPointerType {
-		t.Errorf("object ContentType after retry = %q, expected %q", got, pointer.ContentPointerType)
+	if got := client.stats[firstPointerID].ContentType; got != pointer.ContentPointerType {
+		t.Errorf("first object ContentType after retry = %q, expected %q", got, pointer.ContentPointerType)
 	}
 	stats, err = store.GetStats(context.Background())
 	if err != nil {
 		t.Fatalf("GetStats after retry: %v", err)
 	}
-	if stats.UniqueBlobs != 1 || stats.DuplicatesFound != 0 {
+	if stats.UniqueBlobs != 1 || stats.DuplicatesFound != 1 || stats.BytesReclaimable != 0 {
 		t.Errorf("cache was not restored after retry: %+v", stats)
 	}
 }
@@ -593,7 +613,9 @@ func TestBlobReferencesAreIndependentAcrossBuckets(t *testing.T) {
 			BlobSize:     size,
 			LastModified: time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC),
 			Hash:         hash,
+			HashAlgo:     "sha256",
 			LastSeenScan: "scan-1",
+			State:        cache.ObjectStateReported,
 		}
 	}
 

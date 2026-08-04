@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -51,6 +53,13 @@ var runInterval = &cobra.Command{
 	Short: "Scans S3 storage in interval from config",
 	Long:  "Scans S3 storage in interval from config",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if addr := os.Getenv("S3_DEDUP_PPROF_ADDR"); addr != "" {
+			listener, err := net.Listen("tcp", addr)
+			if err != nil {
+				return fmt.Errorf("start pprof: %w", err)
+			}
+			go http.Serve(listener, nil)
+		}
 		return runPeriodic(cmd.Context(), configPath, runReportPath)
 	},
 }
@@ -205,16 +214,14 @@ func runLoop(ctx context.Context, interval time.Duration, scan ScanFunc, out str
 }
 
 func init() {
-	scanOnce.Flags().StringVarP(&configPath, "config", "c", "", "Config path")
 	scanOnce.Flags().StringVarP(&scanReportPath, "out", "o", "report.json", "Report path")
-	scanOnce.MarkFlagRequired("config")
 
-	runInterval.Flags().StringVarP(&configPath, "config", "c", "", "Config path")
 	runInterval.Flags().StringVarP(&runReportPath, "out", "o", "report.json", "Report path")
-	runInterval.MarkFlagRequired("config")
 
 	reportCommand.Flags().StringVarP(&reportOutputPath, "out", "o", "", "Report path")
 	reportCommand.MarkFlagRequired("out")
+
+	rootCmd.PersistentFlags().StringVarP(&configPath, "config", "c", "config.yaml", "Config path")
 	rootCmd.AddCommand(scanOnce)
 	rootCmd.AddCommand(runInterval)
 	rootCmd.AddCommand(reportCommand)

@@ -185,9 +185,7 @@ func (s *Scanner) OneLap(
 						if relinked {
 							atomics.objectsRelinked.Add(1)
 						}
-						if reclaimed > 0 {
-							atomics.bytesReclaimed.Add(reclaimed)
-						}
+						atomics.bytesReclaimed.Add(reclaimed)
 					}
 				default:
 					processErr = fmt.Errorf("Mode %q is not supported", s.config.Dedup.Mode)
@@ -209,7 +207,6 @@ func (s *Scanner) OneLap(
 				}
 				err := s.store.MarkObjectSeen(ctx, bucket.Name, info.Key, scanID)
 				if err != nil {
-					atomics.processErrors.Add(1)
 					return fmt.Errorf("MarkObjectSeen error for %q: %w\n", info.Key, err)
 				}
 				if info.Size < s.config.Dedup.MinSizeBytes && info.ContentType != pointer.ContentPointerType {
@@ -221,7 +218,6 @@ func (s *Scanner) OneLap(
 				status, err := s.store.GetObjectStatus(ctx, bucket.Name, info.Key, info.ETag, info.Size, s.config.Dedup.HashAlgo, info.LastModified)
 				if err != nil {
 					s.logging.Errorf("GetObjectStatus %s/%s: %v", bucket.Name, info.Key, err)
-					scanReport.Errors++
 					return fmt.Errorf("GetObjectStatus %q/%q: %w", bucket.Name, info.Key, err)
 				}
 
@@ -254,7 +250,6 @@ func (s *Scanner) OneLap(
 			})
 
 		if err != nil {
-			scanReport.Errors++
 			s.logging.Errorf("Listing object error %v, stopping scan\n", err)
 			return err
 		}
@@ -271,7 +266,6 @@ func (s *Scanner) OneLap(
 	for _, bucket := range s.config.S3.Buckets {
 		_, err := s.store.FinalizeScope(ctx, bucket.Name, bucket.Prefix, scanID)
 		if err != nil {
-			scanReport.Errors++
 			return fmt.Errorf("FinalizeScope for %q/%q: %w", bucket.Name, bucket.Prefix, err)
 		}
 	}

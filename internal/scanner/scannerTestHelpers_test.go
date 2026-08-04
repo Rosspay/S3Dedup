@@ -59,6 +59,7 @@ func testConfig() *config.Config {
 		Dedup: config.Dedup{
 			HashAlgo:     "sha256",
 			MinSizeBytes: 0,
+			BlobBucket:   "bucket",
 			BlobPrefix:   "blobs/",
 			Mode:         "report_only",
 		},
@@ -76,7 +77,9 @@ func record(bucket, key, hash string, size int64) cache.ObjectRecord {
 		BlobSize:     size,
 		LastModified: time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC),
 		Hash:         hash,
+		HashAlgo:     "sha256",
 		LastSeenScan: "scan-1",
+		State:        cache.ObjectStateReported,
 	}
 }
 
@@ -103,7 +106,12 @@ func pointerTestConfig() *config.Config {
 
 func hashContent(t *testing.T, content string) string {
 	t.Helper()
-	hash, err := hashing.HashReader(strings.NewReader(content), "sha256")
+	return hashContentWithAlgo(t, content, "sha256")
+}
+
+func hashContentWithAlgo(t *testing.T, content, hashAlgo string) string {
+	t.Helper()
+	hash, err := hashing.HashReader(strings.NewReader(content), hashAlgo)
 	if err != nil {
 		t.Fatalf("HashReader error: %v", err)
 	}
@@ -112,9 +120,15 @@ func hashContent(t *testing.T, content string) string {
 
 func pointerDocument(t *testing.T, blobBucket, blobKey, hash string, size int64) string {
 	t.Helper()
+	return pointerDocumentWithAlgo(t, blobBucket, blobKey, "sha256", hash, size)
+}
+
+func pointerDocumentWithAlgo(t *testing.T, blobBucket, blobKey, hashAlgo, hash string, size int64) string {
+	t.Helper()
 	body, err := json.Marshal(map[string]any{
 		"blob_bucket":  blobBucket,
 		"blob_key":     blobKey,
+		"hash_algo":    hashAlgo,
 		"hash":         hash,
 		"size":         size,
 		"content_type": "application/octet-stream",

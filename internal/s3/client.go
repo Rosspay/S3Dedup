@@ -39,6 +39,8 @@ func NewClient(ctx context.Context, config *config.Config, logger logger.Logger)
 	return &Client{S3Client: client, logging: &logger}, nil
 }
 
+//func NewClientWithouConfig()
+
 // Health check that:
 // 1. Verifies that client can reach the S3 storage
 // 2. Verifies that every bucket listed in config exists and is accesible

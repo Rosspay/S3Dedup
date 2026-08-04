@@ -12,7 +12,8 @@ import (
 )
 
 func TestPointerModeRestartWithSameSQLiteDoesNotRewriteObjects(t *testing.T) {
-	const key = "original.txt"
+	const firstKey = "original-one.txt"
+	const secondKey = "original-two.txt"
 	const content = "persisted cache must survive restart"
 
 	ctx := context.Background()
@@ -25,9 +26,13 @@ func TestPointerModeRestartWithSameSQLiteDoesNotRewriteObjects(t *testing.T) {
 	cfg := pointerTestConfig()
 	cfg.Dedup.DeleteOriginals = true
 	client := &mockS3Client{
-		objects: []minio.ObjectInfo{objectInfo(key, int64(len(content)))},
+		objects: []minio.ObjectInfo{
+			objectInfo(firstKey, int64(len(content))),
+			objectInfo(secondKey, int64(len(content))),
+		},
 		contents: map[string]string{
-			objectID("bucket", key): content,
+			objectID("bucket", firstKey):  content,
+			objectID("bucket", secondKey): content,
 		},
 	}
 
@@ -64,7 +69,8 @@ func TestPointerModeRestartWithSameSQLiteDoesNotRewriteObjects(t *testing.T) {
 	if client.errors == nil {
 		client.errors = make(map[string]error)
 	}
-	client.errors[objectID("bucket", key)] = errors.New("unchanged pointer must not be read")
+	client.errors[objectID("bucket", firstKey)] = errors.New("unchanged pointer must not be read")
+	client.errors[objectID("bucket", secondKey)] = errors.New("unchanged pointer must not be read")
 	client.mu.Unlock()
 
 	secondResult, err := newTestScanner(t, client, secondStore, cfg).ScanOnce(ctx)
@@ -153,19 +159,23 @@ func TestPointerModeRepeatedScanDoesNotUploadBlobAgain(t *testing.T) {
 		t.Errorf("cache stats after second scan = %+v, expected %+v", secondStats, firstStats)
 	}
 }
-func TestPointerModeNextScanRecognizesPointerWithoutCreatingBlobAgain(t *testing.T) {
-	const key = "document.txt"
+func TestPointerModeNextScanRecognizesPointersWithoutCreatingBlobAgain(t *testing.T) {
+	const firstKey = "document-one.txt"
+	const secondKey = "document-two.txt"
 	const content = "content converted to pointer"
 
 	firstStore := openTestStore(t)
-	info := objectInfo(key, int64(len(content)))
+	firstInfo := objectInfo(firstKey, int64(len(content)))
+	secondInfo := objectInfo(secondKey, int64(len(content)))
 	client := &mockS3Client{
-		objects: []minio.ObjectInfo{info},
+		objects: []minio.ObjectInfo{firstInfo, secondInfo},
 		contents: map[string]string{
-			objectID("bucket", key): content,
+			objectID("bucket", firstKey):  content,
+			objectID("bucket", secondKey): content,
 		},
 		stats: map[string]minio.ObjectInfo{
-			objectID("bucket", key): info,
+			objectID("bucket", firstKey):  firstInfo,
+			objectID("bucket", secondKey): secondInfo,
 		},
 	}
 	cfg := pointerTestConfig()
@@ -176,18 +186,21 @@ func TestPointerModeNextScanRecognizesPointerWithoutCreatingBlobAgain(t *testing
 	if err != nil {
 		t.Fatalf("first ScanOnce error: %v", err)
 	}
-	if firstResult.Errors != 0 || firstResult.ObjectsRelinked != 1 {
-		t.Fatalf("first result = errors %d, relinked %d; expected 0 and 1", firstResult.Errors, firstResult.ObjectsRelinked)
+	if firstResult.Errors != 0 || firstResult.ObjectsRelinked != 2 {
+		t.Fatalf("first result = errors %d, relinked %d; expected 0 and 2", firstResult.Errors, firstResult.ObjectsRelinked)
 	}
 	hash := hashContent(t, content)
 	blobKey := cfg.Dedup.BlobPrefix + hash
 	blobPutCalls := client.putCallCount("bucket", blobKey)
-	pointerPutCalls := client.putCallCount("bucket", key)
-	if blobPutCalls != 1 || pointerPutCalls != 1 {
-		t.Fatalf("first PutObject calls = blob %d, pointer %d; expected 1 and 1", blobPutCalls, pointerPutCalls)
+	firstPointerPutCalls := client.putCallCount("bucket", firstKey)
+	secondPointerPutCalls := client.putCallCount("bucket", secondKey)
+	if blobPutCalls != 1 || firstPointerPutCalls != 1 || secondPointerPutCalls != 1 {
+		t.Fatalf("first PutObject calls = blob %d, pointers %d/%d; expected 1 and 1/1", blobPutCalls, firstPointerPutCalls, secondPointerPutCalls)
 	}
-	if got := client.stats[objectID("bucket", key)].ContentType; got != pointer.ContentPointerType {
-		t.Fatalf("pointer ContentType = %q, expected %q", got, pointer.ContentPointerType)
+	for _, key := range []string{firstKey, secondKey} {
+		if got := client.stats[objectID("bucket", key)].ContentType; got != pointer.ContentPointerType {
+			t.Fatalf("pointer %q ContentType = %q, expected %q", key, got, pointer.ContentPointerType)
+		}
 	}
 
 	secondStore := openTestStore(t)
@@ -204,8 +217,11 @@ func TestPointerModeNextScanRecognizesPointerWithoutCreatingBlobAgain(t *testing
 	if got := client.putCallCount("bucket", blobKey); got != blobPutCalls {
 		t.Errorf("blob PutObject calls after second scan = %d, expected %d", got, blobPutCalls)
 	}
-	if got := client.putCallCount("bucket", key); got != pointerPutCalls {
-		t.Errorf("pointer PutObject calls after second scan = %d, expected %d", got, pointerPutCalls)
+	if got := client.putCallCount("bucket", firstKey); got != firstPointerPutCalls {
+		t.Errorf("first pointer PutObject calls after second scan = %d, expected %d", got, firstPointerPutCalls)
+	}
+	if got := client.putCallCount("bucket", secondKey); got != secondPointerPutCalls {
+		t.Errorf("second pointer PutObject calls after second scan = %d, expected %d", got, secondPointerPutCalls)
 	}
 	if secondResult.UniqueBlobs != 1 {
 		t.Errorf("second UniqueBlobs = %d, expected 1", secondResult.UniqueBlobs)

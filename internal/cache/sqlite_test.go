@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -196,6 +197,129 @@ func TestFinalizeScopeDoesNotAffectDiffPrefix(t *testing.T) {
 
 }
 
+func TestGetObjectStatusReturnsStateAndGroupRefCount(t *testing.T) {
+	store := openTestStore(t)
+	first := record("bucket", "one.txt", "same-hash", 100)
+	second := record("bucket", "two.txt", "same-hash", 100)
+	register(t, store, first)
+	register(t, store, second)
+
+	status, err := store.GetObjectStatus(
+		context.Background(),
+		first.Bucket,
+		first.Key,
+		first.ETag,
+		first.Size,
+		first.HashAlgo,
+		first.LastModified,
+	)
+	if err != nil {
+		t.Fatalf("GetObjectStatus error: %v", err)
+	}
+	if !status.Unchanged || status.State != ObjectStateReported || status.RefCount != 2 {
+		t.Errorf("status = %+v, expected unchanged reported object with ref_count 2", status)
+	}
+}
+
+func TestGetObjectStatusDifferentHashAlgorithmIsChanged(t *testing.T) {
+	store := openTestStore(t)
+	object := record("bucket", "one.txt", "hash", 100)
+	register(t, store, object)
+
+	status, err := store.GetObjectStatus(
+		context.Background(),
+		object.Bucket,
+		object.Key,
+		object.ETag,
+		object.Size,
+		"sha512",
+		object.LastModified,
+	)
+	if err != nil {
+		t.Fatalf("GetObjectStatus error: %v", err)
+	}
+	if status.Unchanged {
+		t.Errorf("status = %+v, expected changed object for a different hash algorithm", status)
+	}
+}
+
+func TestRegisterObjectSameBlobUpdatesStateAndHashAlgorithm(t *testing.T) {
+	store := openTestStore(t)
+	object := record("bucket", "one.txt", "hash", 100)
+	register(t, store, object)
+
+	object.HashAlgo = "sha512"
+	object.State = ObjectStatePointer
+	object.ETag = "pointer-etag"
+	object.Size = 64
+	object.LastSeenScan = "scan-2"
+	register(t, store, object)
+
+	assertRefCount(t, store, "bucket", "hash", 1)
+	var hashAlgo string
+	var state ObjectState
+	if err := store.db.QueryRow(`
+		SELECT hash_algo, object_state
+		FROM objects
+		WHERE bucket = ? AND object_key = ?
+	`, object.Bucket, object.Key).Scan(&hashAlgo, &state); err != nil {
+		t.Fatalf("read updated object: %v", err)
+	}
+	if hashAlgo != object.HashAlgo || state != object.State {
+		t.Errorf("stored hash_algo/state = %q/%q, expected %q/%q", hashAlgo, state, object.HashAlgo, object.State)
+	}
+}
+
+func TestGetStatsTracksOnlyRemainingOriginalObjects(t *testing.T) {
+	tests := []struct {
+		name     string
+		states   []ObjectState
+		expected int64
+	}{
+		{name: "all reported", states: []ObjectState{ObjectStateReported, ObjectStateReported, ObjectStateReported}, expected: 200},
+		{name: "blob exists with originals", states: []ObjectState{ObjectStatePointer, ObjectStateReported, ObjectStateReported}, expected: 200},
+		{name: "all blob ready", states: []ObjectState{ObjectStateBlobReady, ObjectStateBlobReady, ObjectStateBlobReady}, expected: 300},
+		{name: "all pointers", states: []ObjectState{ObjectStatePointer, ObjectStatePointer, ObjectStatePointer}, expected: 0},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := openTestStore(t)
+			for i, state := range test.states {
+				object := record("bucket", fmt.Sprintf("object-%d", i), "same-hash", 100)
+				object.State = state
+				register(t, store, object)
+			}
+
+			stats, err := store.GetStats(context.Background())
+			if err != nil {
+				t.Fatalf("GetStats error: %v", err)
+			}
+			if stats.UniqueBlobs != 1 || stats.DuplicatesFound != 2 || stats.BytesReclaimable != test.expected {
+				t.Errorf("GetStats = %+v, expected one blob, two duplicates and %d reclaimable bytes", stats, test.expected)
+			}
+		})
+	}
+}
+
+func TestMarkObjectSeenDoesNotDependOnHashAlgorithm(t *testing.T) {
+	store := openTestStore(t)
+	object := record("bucket", "one.txt", "hash", 100)
+	register(t, store, object)
+
+	if err := store.MarkObjectSeen(context.Background(), object.Bucket, object.Key, "scan-2"); err != nil {
+		t.Fatalf("MarkObjectSeen error: %v", err)
+	}
+	removed, err := store.FinalizeScope(context.Background(), object.Bucket, "", "scan-2")
+	if err != nil {
+		t.Fatalf("FinalizeScope error: %v", err)
+	}
+	if removed != 0 {
+		t.Errorf("FinalizeScope removed %d objects, expected 0", removed)
+	}
+	assertRefCount(t, store, object.BlobBucket, object.Hash, 1)
+}
+
 func openTestStore(t *testing.T) *SQLiteStore {
 	t.Helper()
 	store, err := OpenSQLite(filepath.Join(t.TempDir(), "test.db"))
@@ -228,7 +352,9 @@ func record(bucket, key, hash string, size int64) ObjectRecord {
 		BlobSize:     size,
 		LastModified: time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC),
 		Hash:         hash,
+		HashAlgo:     "sha256",
 		LastSeenScan: "scan-1",
+		State:        ObjectStateReported,
 	}
 }
 
