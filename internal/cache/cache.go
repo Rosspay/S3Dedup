@@ -14,9 +14,9 @@ type Store interface {
 		bucket string,
 		key string,
 		etag string,
-		size int64,
+		// size int64,
 		hashAlgo string,
-		lastModified time.Time,
+		// lastModified time.Time,
 	) (status ObjectStatus, err error)
 	GetStats(ctx context.Context) (Stats, error)
 	MarkObjectSeen(ctx context.Context, bucket, key, scanID string) error

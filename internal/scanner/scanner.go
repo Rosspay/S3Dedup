@@ -104,15 +104,11 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 		workers = int64(runtime.NumCPU() * 2)
 	}
 
-	// var objectsScanned atomic.Int64
-	// var processErrors atomic.Int64
-	// var objectsRelinked atomic.Int64
-	// var bytesReclaimed atomic.Int64
-
 	var atomics atomicReportPart
 
 	defer func() {
 		scanReport.ScanFinished = time.Now().UTC()
+		s.logging.Infof("Scan %s finished at %s", scanID, scanReport.ScanFinished)
 		fmt.Printf("Scan %s finished at %s in %f\n", scanID, scanReport.ScanFinished, time.Since(scanReport.ScanStarted).Seconds())
 		scanReport.ObjectsScanned = atomics.objectsScanned.Load()
 		scanReport.Errors += atomics.processErrors.Load()
@@ -120,14 +116,14 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 		scanReport.BytesReclaimed = atomics.bytesReclaimed.Load()
 	}()
 
-	if err := s.OneLap(ctx, &scanReport, &atomics, "report_only", workers, scanID); err != nil {
-		scanReport.Errors++
-		return scanReport, err
-	}
+	// if err := s.oneLap(ctx, &scanReport, &atomics, "report_only", workers, scanID); err != nil {
+	// 	scanReport.Errors++
+	// 	return scanReport, err
+	// }
 
 	var gcBytes int64
 	if s.config.Dedup.Mode == "pointer" {
-		if err := s.OneLap(ctx, &scanReport, &atomics, "pointer", workers, scanID); err != nil {
+		if err := s.oneLap(ctx, &scanReport, &atomics, "pointer", workers, scanID); err != nil {
 			scanReport.Errors++
 			return scanReport, err
 		}
@@ -156,7 +152,12 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 	return scanReport, nil
 }
 
-func (s *Scanner) OneLap(
+type dupesCount struct {
+	previous minio.ObjectInfo
+	cnt      int64
+}
+
+func (s *Scanner) oneLap(
 	ctx context.Context,
 	scanReport *report.Report,
 	atomics *atomicReportPart,
@@ -166,6 +167,7 @@ func (s *Scanner) OneLap(
 ) error {
 	jobs := make(chan objectJob, workers)
 	var wg sync.WaitGroup
+	dupes := make(map[string]*dupesCount)
 	for i := 0; i < int(workers); i++ {
 		wg.Add(1)
 		go func() {
@@ -177,16 +179,21 @@ func (s *Scanner) OneLap(
 				case "report_only":
 					processErr = s.processObject(ctx, job.buket, job.info, job.scanID)
 				case "pointer":
-					var reclaimed int64
-					var relinked bool
-					reclaimed, relinked, processErr = s.processObjectPointer(ctx, job.buket, job.info, job.scanID)
+					if dupes[job.info.ETag].cnt == 1 {
+						processErr = s.processObject(ctx, job.buket, job.info, job.scanID)
+					} else {
+						var reclaimed int64
+						var relinked bool
+						reclaimed, relinked, processErr = s.processObjectPointer(ctx, job.buket, job.info, job.scanID)
 
-					if s.config.Dedup.DeleteOriginals && processErr == nil {
-						if relinked {
-							atomics.objectsRelinked.Add(1)
+						if s.config.Dedup.DeleteOriginals && processErr == nil {
+							if relinked {
+								atomics.objectsRelinked.Add(1)
+							}
+							atomics.bytesReclaimed.Add(reclaimed)
 						}
-						atomics.bytesReclaimed.Add(reclaimed)
 					}
+
 				default:
 					processErr = fmt.Errorf("Mode %q is not supported", s.config.Dedup.Mode)
 				}
@@ -197,7 +204,38 @@ func (s *Scanner) OneLap(
 			}
 		}()
 	}
-	fmt.Printf("Scan %s started at %s\n", scanID, scanReport.ScanStarted)
+	fn := func(bucket string, dupeInfo minio.ObjectInfo) error {
+		status, err := s.store.GetObjectStatus(ctx, bucket, dupeInfo.Key, dupeInfo.ETag, s.config.Dedup.HashAlgo)
+		if err != nil {
+			s.logging.Errorf("GetObjectStatus %s/%s: %v", bucket, dupeInfo.Key, err)
+			return fmt.Errorf("GetObjectStatus %q/%q: %w", bucket, dupeInfo.Key, err)
+		}
+		if status.Unchanged {
+			switch {
+			case mode == "report_only" && stateRank(status.State) >= stateRank(cache.ObjectStateReported):
+				s.logging.Debugf("Object %s/%s skipped because already reported\n", bucket, dupeInfo.Key)
+				return nil
+
+			case mode == "pointer" && status.RefCount <= 1:
+				s.logging.Debugf("Object %s/%s skipped because ref_count = 1\n", bucket, dupeInfo.Key)
+				return nil
+
+			case mode == "pointer" && stateRank(status.State) >= stateRank(desiredState(mode, s.config.Dedup.DeleteOriginals)):
+				s.logging.Debugf("Object %s/%s skipped because unchanged and ready\n", bucket, dupeInfo.Key)
+				return nil
+			}
+		}
+		select {
+		case jobs <- objectJob{
+			buket:  bucket,
+			info:   dupeInfo,
+			scanID: scanID,
+		}:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	s.logging.Infof("Scan %s started at %s\n", scanID, scanReport.ScanStarted)
 	for _, bucket := range s.config.S3.Buckets {
 		err := s.s3Client.ListObjects(ctx, bucket.Name, bucket.Prefix, true,
@@ -215,38 +253,33 @@ func (s *Scanner) OneLap(
 				if mode == s.config.Dedup.Mode {
 					atomics.objectsScanned.Add(1)
 				}
-				status, err := s.store.GetObjectStatus(ctx, bucket.Name, info.Key, info.ETag, info.Size, s.config.Dedup.HashAlgo, info.LastModified)
-				if err != nil {
-					s.logging.Errorf("GetObjectStatus %s/%s: %v", bucket.Name, info.Key, err)
-					return fmt.Errorf("GetObjectStatus %q/%q: %w", bucket.Name, info.Key, err)
-				}
 
-				if status.Unchanged {
-					switch {
-					case mode == "report_only" && stateRank(status.State) >= stateRank(cache.ObjectStateReported):
-						s.logging.Debugf("Object %s/%s skipped because already reported\n", bucket.Name, info.Key)
-						return nil
-
-					case mode == "pointer" && status.RefCount <= 1:
-						s.logging.Debugf("Object %s/%s skipped because ref_count = 1\n", bucket.Name, info.Key)
-						return nil
-
-					case mode == "pointer" && stateRank(status.State) >= stateRank(desiredState(mode, s.config.Dedup.DeleteOriginals)):
-						s.logging.Debugf("Object %s/%s skipped because unchanged and ready\n", bucket.Name, info.Key)
-						return nil
+				_, ok := dupes[info.ETag]
+				if ok {
+					dupes[info.ETag].cnt++
+				} else {
+					dupes[info.ETag] = &dupesCount{
+						previous: info,
+						cnt:      1,
 					}
 				}
-
-				select {
-				case jobs <- objectJob{
-					buket:  bucket.Name,
-					info:   info,
-					scanID: scanID,
-				}:
-					return nil
-				case <-ctx.Done():
-					return ctx.Err()
+				switch dupes[info.ETag].cnt {
+				case 2:
+					err := fn(bucket.Name, dupes[info.ETag].previous)
+					if err != nil {
+						return err
+					}
+					err = fn(bucket.Name, info)
+					if err != nil {
+						return err
+					}
+				default:
+					err = fn(bucket.Name, info)
+					if err != nil {
+						return err
+					}
 				}
+				return nil
 			})
 
 		if err != nil {

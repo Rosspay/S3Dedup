@@ -316,7 +316,7 @@ func TestPointerModeAdvancesBlobReadyObjectsToPointers(t *testing.T) {
 	}
 	for _, key := range []string{firstKey, secondKey} {
 		info := objectInfo(key, int64(len(content)))
-		status, err := store.GetObjectStatus(ctx, "bucket", key, info.ETag, info.Size, cfg.Dedup.HashAlgo, info.LastModified)
+		status, err := store.GetObjectStatus(ctx, "bucket", key, info.ETag, cfg.Dedup.HashAlgo)
 		if err != nil {
 			t.Fatalf("GetObjectStatus %q: %v", key, err)
 		}
@@ -347,7 +347,7 @@ func TestPointerModeAdvancesBlobReadyObjectsToPointers(t *testing.T) {
 	}
 	for _, key := range []string{firstKey, secondKey} {
 		info := client.stats[objectID("bucket", key)]
-		status, err := store.GetObjectStatus(ctx, "bucket", key, info.ETag, info.Size, cfg.Dedup.HashAlgo, info.LastModified)
+		status, err := store.GetObjectStatus(ctx, "bucket", key, info.ETag, cfg.Dedup.HashAlgo)
 		if err != nil {
 			t.Fatalf("GetObjectStatus %q after relink: %v", key, err)
 		}

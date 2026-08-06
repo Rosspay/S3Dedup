@@ -209,9 +209,9 @@ func TestGetObjectStatusReturnsStateAndGroupRefCount(t *testing.T) {
 		first.Bucket,
 		first.Key,
 		first.ETag,
-		first.Size,
+		// first.Size,
 		first.HashAlgo,
-		first.LastModified,
+		// first.LastModified,
 	)
 	if err != nil {
 		t.Fatalf("GetObjectStatus error: %v", err)
@@ -231,9 +231,9 @@ func TestGetObjectStatusDifferentHashAlgorithmIsChanged(t *testing.T) {
 		object.Bucket,
 		object.Key,
 		object.ETag,
-		object.Size,
+		// object.Size,
 		"sha512",
-		object.LastModified,
+		// object.LastModified,
 	)
 	if err != nil {
 		t.Fatalf("GetObjectStatus error: %v", err)

@@ -37,6 +37,7 @@ func NewClient(ctx context.Context, config *config.Config, logger logger.Logger)
 		return nil, fmt.Errorf("Error creating S3 client: %w", err)
 	}
 	return &Client{S3Client: client, logging: &logger}, nil
+
 }
 
 //func NewClientWithouConfig()
