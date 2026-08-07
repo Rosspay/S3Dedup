@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -226,9 +225,7 @@ func (s *SQLiteStore) GetObjectStatus(
 	bucket string,
 	key string,
 	etag string,
-	size int64,
 	hashAlgo string,
-	lastModified time.Time,
 ) (status ObjectStatus, err error) {
 	const query = `
 	SELECT o.object_state, b.ref_count 
@@ -239,11 +236,9 @@ func (s *SQLiteStore) GetObjectStatus(
 	WHERE o.bucket = ?
 	AND o.object_key = ? 
 	AND o.etag = ?
-	AND o.size = ?
 	AND o.hash_algo = ?
-	AND o.last_modified = ?
 	`
-	err = s.db.QueryRowContext(ctx, query, bucket, key, etag, size, hashAlgo, lastModified.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")).Scan(&status.State, &status.RefCount)
+	err = s.db.QueryRowContext(ctx, query, bucket, key, etag, hashAlgo).Scan(&status.State, &status.RefCount)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return ObjectStatus{}, nil
