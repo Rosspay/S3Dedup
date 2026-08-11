@@ -14,11 +14,12 @@ type Store interface {
 		bucket string,
 		key string,
 		etag string,
-		// size int64,
+		size int64,
 		hashAlgo string,
-		// lastModified time.Time,
+		lastModified time.Time,
 	) (status ObjectStatus, err error)
 	GetStats(ctx context.Context) (Stats, error)
+	ListObjectsByBlob(ctx context.Context, blobBucket, blobHash string) ([]ObjectRecord, error)
 	MarkObjectSeen(ctx context.Context, bucket, key, scanID string) error
 	FinalizeScope(ctx context.Context, bucket, prefix, scanID string) (removed int64, err error)
 	ListUnreferencedBlobs(ctx context.Context, bucket string) (blobList []BlobRecord, err error)

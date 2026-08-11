@@ -7,13 +7,13 @@ s3:
   secret_key: "password"
   use_path_style: true
   buckets:
-  - name: "my-bucket"
-    prefix: "my-prefix/"
+  - name: "unique-bucket"
+    prefix: ""
   #- name: "next-bucket"
   #  prefix: "next-prefix/"
 dedup:
   hash_algo: "sha256"
-  min_size_bytes: 100 #
+  min_size_bytes: 0 #
   blob_bucket: "blobs-bucket"
   blob_prefix: "blobs/"
   mode: "pointer" # report_only | pointer

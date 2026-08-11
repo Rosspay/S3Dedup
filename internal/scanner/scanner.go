@@ -62,11 +62,12 @@ type S3Client interface {
 }
 
 type Scanner struct {
-	s3Client  S3Client
-	store     cache.Store
-	config    *config.Config
-	logging   *logger.Logger
-	blobLocks sync.Map
+	s3Client   S3Client
+	store      cache.Store
+	config     *config.Config
+	logging    *logger.Logger
+	blobLocks  sync.Map
+	groupLocks sync.Map
 }
 
 type objectJob struct {
@@ -91,6 +92,26 @@ type atomicReportPart struct {
 	bytesReclaimed  atomic.Int64
 }
 
+type objectProcessingErrors struct {
+	errors []error
+}
+
+func (e *objectProcessingErrors) Error() string {
+	return errors.Join(e.errors...).Error()
+}
+
+func (e *objectProcessingErrors) Unwrap() []error {
+	return e.errors
+}
+
+func processingErrorCount(err error) int64 {
+	var groupErr *objectProcessingErrors
+	if errors.As(err, &groupErr) {
+		return int64(len(groupErr.errors))
+	}
+	return 1
+}
+
 func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resErr error) {
 	scanReport.ScanStarted = time.Now().UTC()
 
@@ -108,7 +129,6 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 
 	defer func() {
 		scanReport.ScanFinished = time.Now().UTC()
-		s.logging.Infof("Scan %s finished at %s", scanID, scanReport.ScanFinished)
 		fmt.Printf("Scan %s finished at %s in %f\n", scanID, scanReport.ScanFinished, time.Since(scanReport.ScanStarted).Seconds())
 		scanReport.ObjectsScanned = atomics.objectsScanned.Load()
 		scanReport.Errors += atomics.processErrors.Load()
@@ -116,20 +136,21 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 		scanReport.BytesReclaimed = atomics.bytesReclaimed.Load()
 	}()
 
-	// if err := s.oneLap(ctx, &scanReport, &atomics, "report_only", workers, scanID); err != nil {
-	// 	scanReport.Errors++
-	// 	return scanReport, err
-	// }
-
 	var gcBytes int64
-	if s.config.Dedup.Mode == "pointer" {
-		if err := s.oneLap(ctx, &scanReport, &atomics, "pointer", workers, scanID); err != nil {
+	switch s.config.Dedup.Mode {
+	case "report_only":
+		if err := s.OneLap(ctx, &scanReport, &atomics, "report_only", workers, scanID); err != nil {
+			scanReport.Errors++
+			return scanReport, err
+		}
+	case "pointer":
+		if err := s.onePassPointer(ctx, &scanReport, &atomics, workers, scanID); err != nil {
 			scanReport.Errors++
 			return scanReport, err
 		}
 		var removedBlobs int64
 		var err error
-		if atomics.processErrors.Load() == 0 && scanReport.Errors == 0 && s.config.Dedup.Mode == "pointer" {
+		if atomics.processErrors.Load() == 0 && scanReport.Errors == 0 {
 			gcBytes, removedBlobs, err = s.collectGarbage(ctx)
 			if err != nil {
 				scanReport.Errors++
@@ -137,8 +158,10 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 			}
 			s.logging.Infof("Blobs removed: %d, bytes reclaimed: %d\n", removedBlobs, gcBytes)
 		}
-
 		atomics.bytesReclaimed.Add(gcBytes)
+	default:
+		scanReport.Errors++
+		return scanReport, fmt.Errorf("Mode %q is not supported", s.config.Dedup.Mode)
 	}
 
 	stats, err := s.store.GetStats(ctx)
@@ -152,12 +175,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 	return scanReport, nil
 }
 
-type dupesCount struct {
-	previous minio.ObjectInfo
-	cnt      int64
-}
-
-func (s *Scanner) oneLap(
+func (s *Scanner) OneLap(
 	ctx context.Context,
 	scanReport *report.Report,
 	atomics *atomicReportPart,
@@ -167,7 +185,6 @@ func (s *Scanner) oneLap(
 ) error {
 	jobs := make(chan objectJob, workers)
 	var wg sync.WaitGroup
-	dupes := make(map[string]*dupesCount)
 	for i := 0; i < int(workers); i++ {
 		wg.Add(1)
 		go func() {
@@ -179,63 +196,27 @@ func (s *Scanner) oneLap(
 				case "report_only":
 					processErr = s.processObject(ctx, job.buket, job.info, job.scanID)
 				case "pointer":
-					if dupes[job.info.ETag].cnt == 1 {
-						processErr = s.processObject(ctx, job.buket, job.info, job.scanID)
-					} else {
-						var reclaimed int64
-						var relinked bool
-						reclaimed, relinked, processErr = s.processObjectPointer(ctx, job.buket, job.info, job.scanID)
+					var reclaimed int64
+					var relinked bool
+					reclaimed, relinked, processErr = s.processObjectPointer(ctx, job.buket, job.info, job.scanID)
 
-						if s.config.Dedup.DeleteOriginals && processErr == nil {
-							if relinked {
-								atomics.objectsRelinked.Add(1)
-							}
-							atomics.bytesReclaimed.Add(reclaimed)
+					if s.config.Dedup.DeleteOriginals && processErr == nil {
+						if relinked {
+							atomics.objectsRelinked.Add(1)
 						}
+						atomics.bytesReclaimed.Add(reclaimed)
 					}
-
 				default:
 					processErr = fmt.Errorf("Mode %q is not supported", s.config.Dedup.Mode)
 				}
 				if processErr != nil {
-					atomics.processErrors.Add(1)
+					atomics.processErrors.Add(processingErrorCount(processErr))
 					s.logging.Errorf("Processing object %s/%s: %v\n", job.buket, job.info.Key, processErr)
 				}
 			}
 		}()
 	}
-	fn := func(bucket string, dupeInfo minio.ObjectInfo) error {
-		status, err := s.store.GetObjectStatus(ctx, bucket, dupeInfo.Key, dupeInfo.ETag, s.config.Dedup.HashAlgo)
-		if err != nil {
-			s.logging.Errorf("GetObjectStatus %s/%s: %v", bucket, dupeInfo.Key, err)
-			return fmt.Errorf("GetObjectStatus %q/%q: %w", bucket, dupeInfo.Key, err)
-		}
-		if status.Unchanged {
-			switch {
-			case mode == "report_only" && stateRank(status.State) >= stateRank(cache.ObjectStateReported):
-				s.logging.Debugf("Object %s/%s skipped because already reported\n", bucket, dupeInfo.Key)
-				return nil
-
-			case mode == "pointer" && status.RefCount <= 1:
-				s.logging.Debugf("Object %s/%s skipped because ref_count = 1\n", bucket, dupeInfo.Key)
-				return nil
-
-			case mode == "pointer" && stateRank(status.State) >= stateRank(desiredState(mode, s.config.Dedup.DeleteOriginals)):
-				s.logging.Debugf("Object %s/%s skipped because unchanged and ready\n", bucket, dupeInfo.Key)
-				return nil
-			}
-		}
-		select {
-		case jobs <- objectJob{
-			buket:  bucket,
-			info:   dupeInfo,
-			scanID: scanID,
-		}:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
+	fmt.Printf("Scan %s started at %s\n", scanID, scanReport.ScanStarted)
 	s.logging.Infof("Scan %s started at %s\n", scanID, scanReport.ScanStarted)
 	for _, bucket := range s.config.S3.Buckets {
 		err := s.s3Client.ListObjects(ctx, bucket.Name, bucket.Prefix, true,
@@ -253,33 +234,38 @@ func (s *Scanner) oneLap(
 				if mode == s.config.Dedup.Mode {
 					atomics.objectsScanned.Add(1)
 				}
+				status, err := s.store.GetObjectStatus(ctx, bucket.Name, info.Key, info.ETag, info.Size, s.config.Dedup.HashAlgo, info.LastModified)
+				if err != nil {
+					s.logging.Errorf("GetObjectStatus %s/%s: %v", bucket.Name, info.Key, err)
+					return fmt.Errorf("GetObjectStatus %q/%q: %w", bucket.Name, info.Key, err)
+				}
 
-				_, ok := dupes[info.ETag]
-				if ok {
-					dupes[info.ETag].cnt++
-				} else {
-					dupes[info.ETag] = &dupesCount{
-						previous: info,
-						cnt:      1,
+				if status.Unchanged {
+					switch {
+					case mode == "report_only" && stateRank(status.State) >= stateRank(cache.ObjectStateReported):
+						s.logging.Debugf("Object %s/%s skipped because already reported\n", bucket.Name, info.Key)
+						return nil
+
+					case mode == "pointer" && status.RefCount <= 1:
+						s.logging.Debugf("Object %s/%s skipped because ref_count = 1\n", bucket.Name, info.Key)
+						return nil
+
+					case mode == "pointer" && stateRank(status.State) >= stateRank(desiredState(mode, s.config.Dedup.DeleteOriginals)):
+						s.logging.Debugf("Object %s/%s skipped because unchanged and ready\n", bucket.Name, info.Key)
+						return nil
 					}
 				}
-				switch dupes[info.ETag].cnt {
-				case 2:
-					err := fn(bucket.Name, dupes[info.ETag].previous)
-					if err != nil {
-						return err
-					}
-					err = fn(bucket.Name, info)
-					if err != nil {
-						return err
-					}
-				default:
-					err = fn(bucket.Name, info)
-					if err != nil {
-						return err
-					}
+
+				select {
+				case jobs <- objectJob{
+					buket:  bucket.Name,
+					info:   info,
+					scanID: scanID,
+				}:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
 				}
-				return nil
 			})
 
 		if err != nil {
@@ -310,37 +296,207 @@ func (s *Scanner) oneLap(
 // (not at the end of the whole scan), keeping open connections bounded.
 func (s *Scanner) processObject(ctx context.Context, bucket string,
 	info minio.ObjectInfo, scanID string) error {
+	_, _, err := s.discoverObject(ctx, bucket, info, scanID)
+	return err
+}
+
+func (s *Scanner) discoverObject(ctx context.Context, bucket string,
+	info minio.ObjectInfo, scanID string) (hash string, isPointer bool, err error) {
 	statObj, err := s.s3Client.StatObject(ctx, bucket, info.Key)
 	if err != nil {
-		return err
+		return "", false, err
 	}
 	if statObj.ContentType == pointer.ContentPointerType {
 		s.logging.Debugf("Object %s/%s is a pointer\n", bucket, info.Key)
-		return s.processPointer(ctx, bucket, info, scanID)
+		return "", true, s.processPointer(ctx, bucket, statObj, scanID)
 	}
 
 	obj, err := s.s3Client.GetObject(ctx, bucket, info.Key)
 	if err != nil {
-		return err
+		return "", false, err
 	}
 	defer obj.Close()
 
-	hash, err := hashing.HashReader(obj, s.config.Dedup.HashAlgo)
+	hash, err = hashing.HashReader(obj, s.config.Dedup.HashAlgo)
 	if err != nil {
-		return err
+		return "", false, err
 	}
 
 	err = s.register(ctx, bucket, s.config.Dedup.BlobBucket, s.config.Dedup.BlobPrefix+hash, info, hash, s.config.Dedup.HashAlgo, info.Size, scanID, cache.ObjectStateReported)
 	if err != nil {
-		return err
+		return "", false, err
 	}
 
+	return hash, false, nil
+}
+
+func (s *Scanner) onePassPointer(
+	ctx context.Context,
+	scanReport *report.Report,
+	atomics *atomicReportPart,
+	workers int64,
+	scanID string,
+) error {
+	jobs := make(chan objectJob, workers)
+	var wg sync.WaitGroup
+	desired := desiredState("pointer", s.config.Dedup.DeleteOriginals)
+
+	for i := 0; i < int(workers); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			for job := range jobs {
+				reclaimed, relinked, processErr := s.processObjectOnePass(ctx, job.buket, job.info, job.scanID)
+				if s.config.Dedup.DeleteOriginals && processErr == nil {
+					atomics.objectsRelinked.Add(relinked)
+					atomics.bytesReclaimed.Add(reclaimed)
+				}
+				if processErr != nil {
+					atomics.processErrors.Add(processingErrorCount(processErr))
+					s.logging.Errorf("Processing object %s/%s: %v\n", job.buket, job.info.Key, processErr)
+				}
+			}
+		}()
+	}
+
+	fmt.Printf("Scan %s started at %s\n", scanID, scanReport.ScanStarted)
+	s.logging.Infof("Scan %s started at %s\n", scanID, scanReport.ScanStarted)
+	for _, bucket := range s.config.S3.Buckets {
+		err := s.s3Client.ListObjects(ctx, bucket.Name, bucket.Prefix, true,
+			func(info minio.ObjectInfo) error {
+				if strings.HasPrefix(info.Key, s.config.Dedup.BlobPrefix) {
+					return nil
+				}
+				if err := s.store.MarkObjectSeen(ctx, bucket.Name, info.Key, scanID); err != nil {
+					return fmt.Errorf("MarkObjectSeen error for %q: %w\n", info.Key, err)
+				}
+				if info.Size < s.config.Dedup.MinSizeBytes && info.ContentType != pointer.ContentPointerType {
+					return s.store.UnregisterObject(ctx, bucket.Name, info.Key)
+				}
+				atomics.objectsScanned.Add(1)
+
+				status, err := s.store.GetObjectStatus(ctx, bucket.Name, info.Key, info.ETag, info.Size, s.config.Dedup.HashAlgo, info.LastModified)
+				if err != nil {
+					s.logging.Errorf("GetObjectStatus %s/%s: %v", bucket.Name, info.Key, err)
+					return fmt.Errorf("GetObjectStatus %q/%q: %w", bucket.Name, info.Key, err)
+				}
+				if status.Unchanged {
+					if stateRank(status.State) >= stateRank(desired) {
+						s.logging.Debugf("Object %s/%s skipped because unchanged and ready\n", bucket.Name, info.Key)
+						return nil
+					}
+					if status.RefCount <= 1 {
+						s.logging.Debugf("Object %s/%s skipped because ref_count = 1\n", bucket.Name, info.Key)
+						return nil
+					}
+				}
+
+				select {
+				case jobs <- objectJob{
+					buket:  bucket.Name,
+					info:   info,
+					scanID: scanID,
+				}:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			})
+
+		if err != nil {
+			s.logging.Errorf("Listing object error %v, stopping scan\n", err)
+			close(jobs)
+			wg.Wait()
+			return err
+		}
+	}
+	close(jobs)
+	wg.Wait()
+
+	s.blobLocks.Range(func(key, _ any) bool {
+		s.blobLocks.Delete(key)
+		return true
+	})
+	s.groupLocks.Range(func(key, _ any) bool {
+		s.groupLocks.Delete(key)
+		return true
+	})
+
+	for _, bucket := range s.config.S3.Buckets {
+		if _, err := s.store.FinalizeScope(ctx, bucket.Name, bucket.Prefix, scanID); err != nil {
+			return fmt.Errorf("FinalizeScope for %q/%q: %w", bucket.Name, bucket.Prefix, err)
+		}
+	}
 	return nil
 }
 
+func (s *Scanner) processObjectOnePass(ctx context.Context, bucket string, info minio.ObjectInfo, scanID string) (reclaimed int64, relinked int64, err error) {
+	hash, isPointer, err := s.discoverObject(ctx, bucket, info, scanID)
+	if err != nil || isPointer {
+		return 0, 0, err
+	}
+
+	status, err := s.store.GetObjectStatus(ctx, bucket, info.Key, info.ETag, info.Size, s.config.Dedup.HashAlgo, info.LastModified)
+	if err != nil {
+		return 0, 0, err
+	}
+	if status.RefCount <= 1 {
+		return 0, 0, nil
+	}
+
+	return s.deduplicateGroup(ctx, s.config.Dedup.BlobBucket, hash, scanID)
+}
+
+func (s *Scanner) deduplicateGroup(ctx context.Context, blobBucket, hash, scanID string) (reclaimed int64, relinked int64, err error) {
+	mu := s.groupMutex(blobBucket, hash)
+	mu.Lock()
+	defer mu.Unlock()
+
+	members, err := s.store.ListObjectsByBlob(ctx, blobBucket, hash)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	desired := desiredState("pointer", s.config.Dedup.DeleteOriginals)
+	var totalReclaimed int64
+	var totalRelinked int64
+	var memberErrors []error
+	for _, member := range members {
+		if stateRank(member.State) >= stateRank(desired) {
+			continue
+		}
+		memberInfo := minio.ObjectInfo{
+			Key:          member.Key,
+			ETag:         member.ETag,
+			Size:         member.Size,
+			LastModified: member.LastModified,
+		}
+		memberReclaimed, memberRelinked, err := s.processObjectPointer(ctx, member.Bucket, memberInfo, scanID)
+		if err != nil {
+			memberErrors = append(memberErrors, fmt.Errorf("deduplicate %q/%q: %w", member.Bucket, member.Key, err))
+			continue
+		}
+		if s.config.Dedup.DeleteOriginals && memberRelinked {
+			totalRelinked++
+		}
+		totalReclaimed += memberReclaimed
+	}
+	if len(memberErrors) > 0 {
+		return totalReclaimed, totalRelinked, &objectProcessingErrors{errors: memberErrors}
+	}
+	return totalReclaimed, totalRelinked, nil
+}
+
 func (s *Scanner) blobMutex(blobBucket, blobKey string) *sync.Mutex {
-	key := blobBucket + blobKey
+	key := blobBucket + "\x00" + blobKey
 	mu, _ := s.blobLocks.LoadOrStore(key, &sync.Mutex{})
+	return mu.(*sync.Mutex)
+}
+
+func (s *Scanner) groupMutex(blobBucket, hash string) *sync.Mutex {
+	key := blobBucket + "\x00" + hash
+	mu, _ := s.groupLocks.LoadOrStore(key, &sync.Mutex{})
 	return mu.(*sync.Mutex)
 }
 
@@ -350,8 +506,9 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 		return 0, false, err
 	}
 	if statObj.ContentType == pointer.ContentPointerType {
-		return 0, false, s.processPointer(ctx, bucket, info, scanID)
+		return 0, false, s.processPointer(ctx, bucket, statObj, scanID)
 	}
+	info.ContentType = statObj.ContentType
 
 	obj, err := s.s3Client.GetObject(ctx, bucket, info.Key)
 	if err != nil {

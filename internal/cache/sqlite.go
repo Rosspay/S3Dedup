@@ -7,8 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-
-	//"time"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -77,7 +76,6 @@ func (s *SQLiteStore) initialize(ctx context.Context) error {
 			FOREIGN KEY (blob_bucket, blob_hash) REFERENCES blobs(bucket, hash)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_objects_blob_bucket_blob_hash ON objects(blob_bucket, blob_hash)`,
-		`CREATE INDEX IF NOT EXISTS idx_objects_bucket_key_etag_hash_algo ON objects(bucket, object_key, etag, hash_algo)`,
 	}
 
 	for _, statement := range statements {
@@ -228,9 +226,9 @@ func (s *SQLiteStore) GetObjectStatus(
 	bucket string,
 	key string,
 	etag string,
-	// size int64,
+	size int64,
 	hashAlgo string,
-	// lastModified time.Time,
+	lastModified time.Time,
 ) (status ObjectStatus, err error) {
 	const query = `
 	SELECT o.object_state, b.ref_count 
@@ -241,9 +239,11 @@ func (s *SQLiteStore) GetObjectStatus(
 	WHERE o.bucket = ?
 	AND o.object_key = ? 
 	AND o.etag = ?
+	AND o.size = ?
 	AND o.hash_algo = ?
+	AND o.last_modified = ?
 	`
-	err = s.db.QueryRowContext(ctx, query, bucket, key, etag, hashAlgo).Scan(&status.State, &status.RefCount)
+	err = s.db.QueryRowContext(ctx, query, bucket, key, etag, size, hashAlgo, lastModified.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")).Scan(&status.State, &status.RefCount)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return ObjectStatus{}, nil
@@ -392,6 +392,62 @@ func (s *SQLiteStore) GetStats(ctx context.Context) (Stats, error) {
 		return Stats{}, fmt.Errorf("Error getting stats: %w", err)
 	}
 	return stats, nil
+}
+
+func (s *SQLiteStore) ListObjectsByBlob(
+	ctx context.Context,
+	blobBucket string,
+	blobHash string,
+) ([]ObjectRecord, error) {
+	const query = `
+	SELECT o.bucket, o.object_key, o.etag, o.size, o.last_modified,
+	       o.blob_bucket, b.blob_key, o.blob_hash, o.hash_algo,
+	       o.last_seen_scan, o.object_state, b.size
+	FROM objects AS o
+	JOIN blobs AS b
+	ON b.bucket = o.blob_bucket
+	AND b.hash = o.blob_hash
+	WHERE o.blob_bucket = ?
+	AND o.blob_hash = ?
+	ORDER BY o.bucket, o.object_key
+	`
+	rows, err := s.db.QueryContext(ctx, query, blobBucket, blobHash)
+	if err != nil {
+		return nil, fmt.Errorf("ListObjectsByBlob %q/%q: %w", blobBucket, blobHash, err)
+	}
+	defer rows.Close()
+
+	var records []ObjectRecord
+	for rows.Next() {
+		var record ObjectRecord
+		var lastModified string
+		if err := rows.Scan(
+			&record.Bucket,
+			&record.Key,
+			&record.ETag,
+			&record.Size,
+			&lastModified,
+			&record.BlobBucket,
+			&record.BlobKey,
+			&record.Hash,
+			&record.HashAlgo,
+			&record.LastSeenScan,
+			&record.State,
+			&record.BlobSize,
+		); err != nil {
+			return nil, fmt.Errorf("ListObjectsByBlob %q/%q: scan row: %w", blobBucket, blobHash, err)
+		}
+		parsed, err := time.Parse("2006-01-02T15:04:05.999999999Z07:00", lastModified)
+		if err != nil {
+			return nil, fmt.Errorf("ListObjectsByBlob %q/%q: parse last_modified: %w", blobBucket, blobHash, err)
+		}
+		record.LastModified = parsed
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListObjectsByBlob %q/%q: rows: %w", blobBucket, blobHash, err)
+	}
+	return records, nil
 }
 
 // Marking object anyway

@@ -209,9 +209,9 @@ func TestGetObjectStatusReturnsStateAndGroupRefCount(t *testing.T) {
 		first.Bucket,
 		first.Key,
 		first.ETag,
-		// first.Size,
+		first.Size,
 		first.HashAlgo,
-		// first.LastModified,
+		first.LastModified,
 	)
 	if err != nil {
 		t.Fatalf("GetObjectStatus error: %v", err)
@@ -231,9 +231,9 @@ func TestGetObjectStatusDifferentHashAlgorithmIsChanged(t *testing.T) {
 		object.Bucket,
 		object.Key,
 		object.ETag,
-		// object.Size,
+		object.Size,
 		"sha512",
-		// object.LastModified,
+		object.LastModified,
 	)
 	if err != nil {
 		t.Fatalf("GetObjectStatus error: %v", err)
@@ -318,6 +318,36 @@ func TestMarkObjectSeenDoesNotDependOnHashAlgorithm(t *testing.T) {
 		t.Errorf("FinalizeScope removed %d objects, expected 0", removed)
 	}
 	assertRefCount(t, store, object.BlobBucket, object.Hash, 1)
+}
+
+func TestListObjectsByBlobReturnsPersistentGroupMembers(t *testing.T) {
+	store := openTestStore(t)
+	first := record("source-a", "one.txt", "same-hash", 100)
+	first.BlobBucket = "blob-bucket"
+	second := record("source-b", "two.txt", "same-hash", 100)
+	second.BlobBucket = "blob-bucket"
+	second.State = ObjectStatePointer
+	register(t, store, first)
+	register(t, store, second)
+
+	members, err := store.ListObjectsByBlob(context.Background(), "blob-bucket", "same-hash")
+	if err != nil {
+		t.Fatalf("ListObjectsByBlob error: %v", err)
+	}
+	if len(members) != 2 {
+		t.Fatalf("ListObjectsByBlob returned %d members, expected 2", len(members))
+	}
+	if members[0].Bucket != "source-a" || members[0].Key != "one.txt" || members[0].State != ObjectStateReported {
+		t.Errorf("first member = %+v", members[0])
+	}
+	if members[1].Bucket != "source-b" || members[1].Key != "two.txt" || members[1].State != ObjectStatePointer {
+		t.Errorf("second member = %+v", members[1])
+	}
+	for _, member := range members {
+		if member.BlobBucket != "blob-bucket" || member.BlobKey != "blobs/same-hash" || member.Hash != "same-hash" {
+			t.Errorf("member blob identity = %+v", member)
+		}
+	}
 }
 
 func openTestStore(t *testing.T) *SQLiteStore {
