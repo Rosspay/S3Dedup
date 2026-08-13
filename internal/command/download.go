@@ -2,13 +2,12 @@ package command
 
 import (
 	"bufio"
-	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"s3-dedup/internal/config"
+	"s3-dedup/internal/downloader"
 	"s3-dedup/internal/logger"
 	"s3-dedup/internal/pointer"
 	"s3-dedup/internal/s3"
@@ -17,28 +16,6 @@ import (
 	"github.com/minio/minio-go/v6"
 	"github.com/spf13/cobra"
 )
-
-type S3ClientForDownload interface {
-	ListObjects(
-		ctx context.Context,
-		bucket string,
-		prefix string,
-		recursive bool,
-		fn func(minio.ObjectInfo) error,
-	) error
-
-	GetObject(
-		ctx context.Context,
-		bucket string,
-		key string,
-	) (io.ReadCloser, error)
-
-	StatObject(
-		ctx context.Context,
-		bucket string,
-		objectName string,
-	) (minio.ObjectInfo, error)
-}
 
 var bucketName string
 var prefixName string
@@ -127,13 +104,13 @@ var listPointers = &cobra.Command{
 	},
 }
 
-var pointerKey string
+var objectKey string
 var downloadPath string
 
-var getObjectByPointerKey = &cobra.Command{
-	Use:   "download-original",
-	Short: "Downloads original by pointer key",
-	Long:  "Downloads original by pointer key",
+var downloadObject = &cobra.Command{
+	Use:     "download",
+	Aliases: []string{"download-original"},
+	Short:   "Downloads an object, resolving pointers to their original content",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
@@ -146,82 +123,23 @@ var getObjectByPointerKey = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		defer logging.Close()
 
-		originalsClient, err := s3.NewClient(ctx, cfg, *logging)
+		s3Client, err := s3.NewClient(ctx, cfg, *logging)
 		if err != nil {
 			return err
 		}
 
-		statInfo, err := originalsClient.StatObject(ctx, bucketName, pointerKey)
+		directory := downloadPath
+		if directory == "" {
+			directory = "."
+		}
+		destination := filepath.Join(directory, filepath.Base(objectKey))
+		result, err := downloader.New(s3Client).Download(ctx, bucketName, objectKey, destination)
 		if err != nil {
 			return err
 		}
-		if statInfo.ContentType != pointer.ContentPointerType {
-			return fmt.Errorf("Object key given is not a pointer type")
-		}
-
-		obj, err := originalsClient.GetObject(ctx, bucketName, pointerKey)
-		if err != nil {
-			return err
-		}
-		defer obj.Close()
-
-		p, err := pointer.ReadPointer(obj)
-		if err != nil {
-			return err
-		}
-		_, err = originalsClient.StatObject(ctx, p.BlobBucket, p.BlobKey)
-		if err != nil {
-			return fmt.Errorf("Blob does not exists")
-		}
-		original, err := originalsClient.GetObject(ctx, p.BlobBucket, p.BlobKey)
-		if err != nil {
-			return err
-		}
-		defer original.Close()
-
-		if downloadPath == "" {
-			downloadPath = "."
-		}
-
-		path, err := filepath.Abs(downloadPath)
-		if err != nil {
-			return err
-		}
-
-		destination := filepath.Join(path, filepath.Base(pointerKey))
-
-		if err := os.MkdirAll(path, 0o755); err != nil {
-			return fmt.Errorf("create download directory %q: %w", path, err)
-		}
-
-		temp, err := os.CreateTemp(path, ".s3-dedup-download-*")
-		if err != nil {
-			return err
-		}
-		tempName := temp.Name()
-		success := false
-		defer func() {
-			temp.Close()
-			if !success {
-				os.Remove(tempName)
-			}
-		}()
-
-		written, err := io.Copy(temp, original)
-		if err != nil {
-			return err
-		}
-		if written != p.Size {
-			return fmt.Errorf("download size: got %d, expected %d", written, p.Size)
-		}
-		if err := temp.Close(); err != nil {
-			return err
-		}
-		if err := os.Rename(tempName, destination); err != nil {
-			return err
-		}
-		success = true
+		fmt.Printf("Downloaded %s/%s to %s\n", result.Bucket, result.Key, result.Destination)
 		return nil
 	},
 }
@@ -232,12 +150,12 @@ func init() {
 	listPointers.MarkFlagRequired("name")
 	listPointers.Flags().StringVarP(&prefixName, "prefix", "p", "", "Prefix in a bucket")
 
-	getObjectByPointerKey.Flags().StringVarP(&bucketName, "name", "n", "", "Bucket name to list objects from")
-	getObjectByPointerKey.MarkFlagRequired("name")
-	getObjectByPointerKey.Flags().StringVarP(&pointerKey, "key", "k", "", "Key for pointer to get the original")
-	getObjectByPointerKey.MarkFlagRequired("key")
-	getObjectByPointerKey.Flags().StringVarP(&downloadPath, "path", "p", "", "Path to download the original to")
+	downloadObject.Flags().StringVarP(&bucketName, "name", "n", "", "Bucket containing the object")
+	downloadObject.MarkFlagRequired("name")
+	downloadObject.Flags().StringVarP(&objectKey, "key", "k", "", "Object key to download")
+	downloadObject.MarkFlagRequired("key")
+	downloadObject.Flags().StringVarP(&downloadPath, "path", "p", "", "Directory to download the object to")
 
 	rootCmd.AddCommand(listPointers)
-	rootCmd.AddCommand(getObjectByPointerKey)
+	rootCmd.AddCommand(downloadObject)
 }

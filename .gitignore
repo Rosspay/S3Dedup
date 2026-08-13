@@ -44,3 +44,5 @@ service.log
 state.db
 report.json
 /bin
+cmd/s3-dedup/state.db-shm
+cmd/s3-dedup/state.db-wal

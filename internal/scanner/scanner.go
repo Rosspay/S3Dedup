@@ -14,6 +14,7 @@ import (
 	"s3-dedup/internal/logger"
 	"s3-dedup/internal/pointer"
 	"s3-dedup/internal/report"
+	"s3-dedup/internal/tempfiles"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -67,6 +68,8 @@ type Scanner struct {
 	config    *config.Config
 	logging   *logger.Logger
 	blobLocks sync.Map
+	tempFiles sync.Map
+	tempDir   string
 }
 
 type objectJob struct {
@@ -81,6 +84,7 @@ func NewScanner(s3Client S3Client, store cache.Store, config *config.Config, log
 		store:    store,
 		config:   config,
 		logging:  logging,
+		tempDir:  os.TempDir(),
 	}
 }
 
@@ -91,8 +95,16 @@ type atomicReportPart struct {
 	bytesReclaimed  atomic.Int64
 }
 
+const scannerTempMaxAge = 24 * time.Hour
+
 func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resErr error) {
 	scanReport.ScanStarted = time.Now().UTC()
+	removedTempFiles, cleanupErr := s.CleanupTempFiles(scannerTempMaxAge)
+	if cleanupErr != nil {
+		s.logging.Warnf("cleanup scanner temporary files: %v\n", cleanupErr)
+	} else if removedTempFiles > 0 {
+		s.logging.Infof("Scanner temporary files removed: %d\n", removedTempFiles)
+	}
 
 	scanReport.Mode = s.config.Dedup.Mode
 	scanID := strconv.FormatInt(scanReport.ScanStarted.UnixNano(), 10)
@@ -103,11 +115,6 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 	if workers > int64(runtime.NumCPU()*2) {
 		workers = int64(runtime.NumCPU() * 2)
 	}
-
-	// var objectsScanned atomic.Int64
-	// var processErrors atomic.Int64
-	// var objectsRelinked atomic.Int64
-	// var bytesReclaimed atomic.Int64
 
 	var atomics atomicReportPart
 
@@ -311,6 +318,37 @@ func (s *Scanner) blobMutex(blobBucket, blobKey string) *sync.Mutex {
 	return mu.(*sync.Mutex)
 }
 
+func (s *Scanner) createTempFile() (*os.File, error) {
+	temp, err := tempfiles.Create(s.tempDir, tempfiles.ScannerPattern)
+	if err != nil {
+		return nil, err
+	}
+	s.tempFiles.Store(temp.Name(), struct{}{})
+	return temp, nil
+}
+
+func (s *Scanner) removeTempFile(temp *os.File) {
+	if temp == nil {
+		return
+	}
+	name := temp.Name()
+	temp.Close()
+	os.Remove(name)
+	s.tempFiles.Delete(name)
+}
+
+func (s *Scanner) CleanupTempFiles(maxAge time.Duration) (int, error) {
+	return tempfiles.RemoveStale(
+		s.tempDir,
+		tempfiles.ScannerPattern,
+		maxAge,
+		func(path string) bool {
+			_, active := s.tempFiles.Load(path)
+			return active
+		},
+	)
+}
+
 func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info minio.ObjectInfo, scanID string) (int64, bool, error) {
 	statObj, err := s.s3Client.StatObject(ctx, bucket, info.Key)
 	if err != nil {
@@ -326,14 +364,11 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 	}
 	defer obj.Close()
 
-	temp, err := os.CreateTemp("", "s3-dedup-*")
+	temp, err := s.createTempFile()
 	if err != nil {
 		return 0, false, err
 	}
-	defer func() {
-		temp.Close()
-		os.Remove(temp.Name())
-	}()
+	defer s.removeTempFile(temp)
 
 	tee := io.TeeReader(obj, temp)
 	hash, err := hashing.HashReader(tee, s.config.Dedup.HashAlgo)
@@ -470,14 +505,11 @@ func (s *Scanner) migratePointerHash(ctx context.Context, bucket string, info mi
 	}
 	defer obj.Close()
 
-	temp, err := os.CreateTemp("", "s3-dedup-*")
+	temp, err := s.createTempFile()
 	if err != nil {
 		return nil, minio.ObjectInfo{}, err
 	}
-	defer func() {
-		temp.Close()
-		os.Remove(temp.Name())
-	}()
+	defer s.removeTempFile(temp)
 
 	tee := io.TeeReader(obj, temp)
 	hash, err := hashing.HashReader(tee, s.config.Dedup.HashAlgo)
