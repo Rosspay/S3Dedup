@@ -88,10 +88,6 @@ func ConfigParser(filePath string) (*Config, error) {
 		return nil, fmt.Errorf("ConfgiParser: cache backend must be sqlite, got %q", cfg.Cache.Backend)
 	}
 
-	if cfg.Dedup.BlobBucket == "" {
-		return nil, fmt.Errorf("ConfigParser: blob_bucket is not configured")
-	}
-
 	interval, err := time.ParseDuration(cfg.Schedule.ScanInterval)
 	if err != nil {
 		return nil, fmt.Errorf("Parse scan interval: %w", err)

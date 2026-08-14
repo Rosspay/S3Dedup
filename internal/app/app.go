@@ -31,16 +31,28 @@ func Open(ctx context.Context, configPath string) (*App, error) {
 
 	s3Client, err := s3.NewClient(ctx, cfg, *logging)
 	if err != nil {
-		return nil, fmt.Errorf("create S3 client: %w", err)
+		logging.Errorf("create S3 client: %v", err)
+		return nil, errors.Join(
+			fmt.Errorf("create S3 client: %w", err),
+			logging.Close(),
+		)
 	}
 
 	if err := s3Client.HealthCheck(ctx, cfg); err != nil {
-		return nil, fmt.Errorf("S3 health check: %w", err)
+		logging.Errorf("S3 health check: %v", err)
+		return nil, errors.Join(
+			fmt.Errorf("S3 health check: %w", err),
+			logging.Close(),
+		)
 	}
 
 	store, err := cache.OpenSQLite(cfg.Cache.Path)
 	if err != nil {
-		return nil, fmt.Errorf("open cache: %w", err)
+		logging.Errorf("open cache: %v", err)
+		return nil, errors.Join(
+			fmt.Errorf("open cache: %w", err),
+			logging.Close(),
+		)
 	}
 
 	scannerService := scanner.NewScanner(s3Client, store, cfg, logging)

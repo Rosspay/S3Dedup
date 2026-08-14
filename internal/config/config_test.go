@@ -25,7 +25,6 @@ func TestBasicConfigParser(t *testing.T) {
 		Dedup: Dedup{
 			HashAlgo:        "sha256",
 			MinSizeBytes:    4096,
-			BlobBucket:      "blobs-bucket",
 			BlobPrefix:      "blobs/",
 			Mode:            "report_only",
 			DeleteOriginals: false,

@@ -64,7 +64,7 @@ func TestScanOnceNoObjectLostDupes(t *testing.T) {
 	t.Parallel()
 	const content = "duplicate"
 	const expObjectsScanned = 100
-	const expBytesReclaimable = 9900
+	const expBytesReclaimable = 99 * int64(len(content))
 	const expUniqueBlobs = 1
 	const expDuplicatesFound = 99
 	const expErrors = 0
@@ -73,7 +73,7 @@ func TestScanOnceNoObjectLostDupes(t *testing.T) {
 	var objs []minio.ObjectInfo
 	contents := make(map[string]string)
 	for i := 0; i < 100; i++ {
-		objs = append(objs, objectInfo("file.txt"+strconv.Itoa(i), 100))
+		objs = append(objs, objectInfo("file.txt"+strconv.Itoa(i), int64(len(content))))
 		contents[objectID("bucket", "file.txt"+strconv.Itoa(i))] = content
 	}
 	client := &mockS3Client{

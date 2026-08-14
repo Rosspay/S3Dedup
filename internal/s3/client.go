@@ -39,8 +39,6 @@ func NewClient(ctx context.Context, config *config.Config, logger logger.Logger)
 	return &Client{S3Client: client, logging: &logger}, nil
 }
 
-//func NewClientWithouConfig()
-
 // Health check that:
 // 1. Verifies that client can reach the S3 storage
 // 2. Verifies that every bucket listed in config exists and is accesible
@@ -58,16 +56,6 @@ func (c *Client) HealthCheck(ctx context.Context, config *config.Config) error {
 		}
 		if !exists {
 			return fmt.Errorf("healthcheck bucket %q: bucket does not exist or is not accessible", bucket.Name)
-		}
-	}
-	blobBucketExists, err := c.S3Client.BucketExistsWithContext(ctx, config.Dedup.BlobBucket)
-	if err != nil {
-		return fmt.Errorf("Healthcheck blobBucket %q: %w", config.Dedup.BlobBucket, err)
-	}
-	if !blobBucketExists {
-		makeErr := c.S3Client.MakeBucketWithContext(ctx, config.Dedup.BlobBucket, config.S3.Region)
-		if makeErr != nil {
-			return fmt.Errorf("Healthcheck make blobBucket %q: %w", config.Dedup.BlobBucket, makeErr)
 		}
 	}
 

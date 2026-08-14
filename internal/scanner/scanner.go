@@ -15,7 +15,6 @@ import (
 	"s3-dedup/internal/pointer"
 	"s3-dedup/internal/report"
 	"s3-dedup/internal/tempfiles"
-	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -117,7 +116,6 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 	}
 
 	var atomics atomicReportPart
-
 	defer func() {
 		scanReport.ScanFinished = time.Now().UTC()
 		fmt.Printf("Scan %s finished at %s in %f\n", scanID, scanReport.ScanFinished, time.Since(scanReport.ScanStarted).Seconds())
@@ -127,156 +125,25 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 		scanReport.BytesReclaimed = atomics.bytesReclaimed.Load()
 	}()
 
-	if err := s.OneLap(ctx, &scanReport, &atomics, "report_only", workers, scanID); err != nil {
-		scanReport.Errors++
-		return scanReport, err
-	}
+	fmt.Printf("Scan %s started at %s\n", scanID, scanReport.ScanStarted)
+	s.logging.Infof("Scan %s started at %s\n", scanID, scanReport.ScanStarted)
 
-	var gcBytes int64
-	if s.config.Dedup.Mode == "pointer" {
-		if err := s.OneLap(ctx, &scanReport, &atomics, "pointer", workers, scanID); err != nil {
+	switch s.config.Dedup.Mode {
+	case "report_only":
+		if err := s.scanReportOnly(ctx, &scanReport, &atomics, workers); err != nil {
 			scanReport.Errors++
 			return scanReport, err
 		}
-		var removedBlobs int64
-		var err error
-		if atomics.processErrors.Load() == 0 && scanReport.Errors == 0 && s.config.Dedup.Mode == "pointer" {
-			gcBytes, removedBlobs, err = s.collectGarbage(ctx)
-			if err != nil {
-				scanReport.Errors++
-				return scanReport, fmt.Errorf("garbage collection: %w", err)
-			}
-			s.logging.Infof("Blobs removed: %d, bytes reclaimed: %d\n", removedBlobs, gcBytes)
+	case "pointer":
+		if err := s.scanPointer(ctx, &scanReport, &atomics, workers, scanID); err != nil {
+			scanReport.Errors++
+			return scanReport, err
 		}
-
-		atomics.bytesReclaimed.Add(gcBytes)
-	}
-
-	stats, err := s.store.GetStats(ctx)
-	if err != nil {
+	default:
 		scanReport.Errors++
-		return scanReport, fmt.Errorf("GetStats error: %w", err)
+		return scanReport, fmt.Errorf("mode %q is not supported", s.config.Dedup.Mode)
 	}
-	scanReport.UniqueBlobs = stats.UniqueBlobs
-	scanReport.DuplicatesFound = stats.DuplicatesFound
-	scanReport.BytesReclaimable = stats.BytesReclaimable
 	return scanReport, nil
-}
-
-func (s *Scanner) OneLap(
-	ctx context.Context,
-	scanReport *report.Report,
-	atomics *atomicReportPart,
-	mode string,
-	workers int64,
-	scanID string,
-) error {
-	jobs := make(chan objectJob, workers)
-	var wg sync.WaitGroup
-	for i := 0; i < int(workers); i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			for job := range jobs {
-				var processErr error
-				switch mode {
-				case "report_only":
-					processErr = s.processObject(ctx, job.buket, job.info, job.scanID)
-				case "pointer":
-					var reclaimed int64
-					var relinked bool
-					reclaimed, relinked, processErr = s.processObjectPointer(ctx, job.buket, job.info, job.scanID)
-
-					if s.config.Dedup.DeleteOriginals && processErr == nil {
-						if relinked {
-							atomics.objectsRelinked.Add(1)
-						}
-						atomics.bytesReclaimed.Add(reclaimed)
-					}
-				default:
-					processErr = fmt.Errorf("Mode %q is not supported", s.config.Dedup.Mode)
-				}
-				if processErr != nil {
-					atomics.processErrors.Add(1)
-					s.logging.Errorf("Processing object %s/%s: %v\n", job.buket, job.info.Key, processErr)
-				}
-			}
-		}()
-	}
-	fmt.Printf("Scan %s started at %s\n", scanID, scanReport.ScanStarted)
-	s.logging.Infof("Scan %s started at %s\n", scanID, scanReport.ScanStarted)
-	for _, bucket := range s.config.S3.Buckets {
-		err := s.s3Client.ListObjects(ctx, bucket.Name, bucket.Prefix, true,
-			func(info minio.ObjectInfo) error {
-				if strings.HasPrefix(info.Key, s.config.Dedup.BlobPrefix) {
-					return nil
-				}
-				err := s.store.MarkObjectSeen(ctx, bucket.Name, info.Key, scanID)
-				if err != nil {
-					return fmt.Errorf("MarkObjectSeen error for %q: %w\n", info.Key, err)
-				}
-				if info.Size < s.config.Dedup.MinSizeBytes && info.ContentType != pointer.ContentPointerType {
-					return s.store.UnregisterObject(ctx, bucket.Name, info.Key)
-				}
-				if mode == s.config.Dedup.Mode {
-					atomics.objectsScanned.Add(1)
-				}
-				status, err := s.store.GetObjectStatus(ctx, bucket.Name, info.Key, info.ETag, info.Size, s.config.Dedup.HashAlgo, info.LastModified)
-				if err != nil {
-					s.logging.Errorf("GetObjectStatus %s/%s: %v", bucket.Name, info.Key, err)
-					return fmt.Errorf("GetObjectStatus %q/%q: %w", bucket.Name, info.Key, err)
-				}
-
-				if status.Unchanged {
-					switch {
-					case mode == "report_only" && stateRank(status.State) >= stateRank(cache.ObjectStateReported):
-						s.logging.Debugf("Object %s/%s skipped because already reported\n", bucket.Name, info.Key)
-						return nil
-
-					case mode == "pointer" && status.RefCount <= 1:
-						s.logging.Debugf("Object %s/%s skipped because ref_count = 1\n", bucket.Name, info.Key)
-						return nil
-
-					case mode == "pointer" && stateRank(status.State) >= stateRank(desiredState(mode, s.config.Dedup.DeleteOriginals)):
-						s.logging.Debugf("Object %s/%s skipped because unchanged and ready\n", bucket.Name, info.Key)
-						return nil
-					}
-				}
-
-				select {
-				case jobs <- objectJob{
-					buket:  bucket.Name,
-					info:   info,
-					scanID: scanID,
-				}:
-					return nil
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-			})
-
-		if err != nil {
-			s.logging.Errorf("Listing object error %v, stopping scan\n", err)
-			return err
-		}
-
-	}
-	close(jobs)
-	wg.Wait()
-
-	s.blobLocks.Range(func(key, _ any) bool {
-		s.blobLocks.Delete(key)
-		return true
-	})
-
-	for _, bucket := range s.config.S3.Buckets {
-		_, err := s.store.FinalizeScope(ctx, bucket.Name, bucket.Prefix, scanID)
-		if err != nil {
-			return fmt.Errorf("FinalizeScope for %q/%q: %w", bucket.Name, bucket.Prefix, err)
-		}
-	}
-	return nil
 }
 
 // processObject streams a single object's content and returns error if occured.
@@ -720,10 +587,7 @@ func (s *Scanner) register(
 	return nil
 }
 
-func desiredState(mode string, deleteOriginals bool) cache.ObjectState {
-	if mode == "report_only" {
-		return cache.ObjectStateReported
-	}
+func desiredPointerState(deleteOriginals bool) cache.ObjectState {
 	if !deleteOriginals {
 		return cache.ObjectStateBlobReady
 	}
