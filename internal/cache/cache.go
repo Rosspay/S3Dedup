@@ -18,6 +18,15 @@ type Store interface {
 		hashAlgo string,
 		lastModified time.Time,
 	) (status ObjectStatus, err error)
+	ApplyDiscoveryBatch(ctx context.Context, mutations []DiscoveryMutation) error
+	ListDedupCandidates(
+		ctx context.Context,
+		bucket string,
+		prefix string,
+		desiredState ObjectState,
+		afterKey string,
+		limit int,
+	) ([]DedupCandidate, error)
 	GetStats(ctx context.Context) (Stats, error)
 	MarkObjectSeen(ctx context.Context, bucket, key, scanID string) error
 	FinalizeScope(ctx context.Context, bucket, prefix, scanID string) (removed int64, err error)
@@ -33,6 +42,34 @@ const (
 	ObjectStateBlobReady ObjectState = "blob_ready"
 	ObjectStatePointer   ObjectState = "pointer"
 )
+
+type DiscoveryMutationKind uint8
+
+const (
+	DiscoveryRegister DiscoveryMutationKind = iota
+	DiscoveryMarkSeen
+	DiscoveryUnregister
+)
+
+type ObjectID struct {
+	Bucket string
+	Key    string
+	ScanID string
+}
+
+type DiscoveryMutation struct {
+	Kind   DiscoveryMutationKind
+	Object ObjectRecord
+	ID     ObjectID
+}
+
+type DedupCandidate struct {
+	Bucket       string
+	Key          string
+	ETag         string
+	Size         int64
+	LastModified time.Time
+}
 
 type ObjectRecord struct {
 	Bucket       string
