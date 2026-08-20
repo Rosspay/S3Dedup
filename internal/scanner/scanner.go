@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"runtime"
 	"s3-dedup/internal/cache"
 	"s3-dedup/internal/config"
 	"s3-dedup/internal/hashing"
@@ -111,9 +110,6 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 	if workers <= 0 {
 		workers = 1
 	}
-	if workers > int64(runtime.NumCPU()*2) {
-		workers = int64(runtime.NumCPU() * 2)
-	}
 
 	var atomics atomicReportPart
 	defer func() {
@@ -146,37 +142,61 @@ func (s *Scanner) ScanOnce(ctx context.Context) (scanReport report.Report, resEr
 	return scanReport, nil
 }
 
-// processObject streams a single object's content and returns error if occured.
-// It is a standalone function so that the deferred Close runs after every object
-// (not at the end of the whole scan), keeping open connections bounded.
-func (s *Scanner) processObject(ctx context.Context, bucket string,
-	info minio.ObjectInfo, scanID string) error {
-	statObj, err := s.s3Client.StatObject(ctx, bucket, info.Key)
+func (s *Scanner) discoverObject(
+	ctx context.Context,
+	bucket string,
+	listedInfo minio.ObjectInfo,
+	scanID string,
+) (cache.ObjectRecord, error) {
+	before, err := s.s3Client.StatObject(ctx, bucket, listedInfo.Key)
+	if err != nil {
+		return cache.ObjectRecord{}, err
+	}
+	if isObjectChanged(listedInfo, before) {
+		return cache.ObjectRecord{}, fmt.Errorf("object changed after listing")
+	}
+	if before.ContentType == pointer.ContentPointerType {
+		s.logging.Debugf("Object %s/%s is a pointer\n", bucket, before.Key)
+		return s.discoverPointer(ctx, bucket, before, scanID)
+	}
+
+	obj, err := s.s3Client.GetObject(ctx, bucket, before.Key)
+	if err != nil {
+		return cache.ObjectRecord{}, err
+	}
+	hash, hashErr := hashing.HashReader(obj, s.config.Dedup.HashAlgo)
+	closeErr := obj.Close()
+	if hashErr != nil {
+		return cache.ObjectRecord{}, hashErr
+	}
+	if closeErr != nil {
+		return cache.ObjectRecord{}, closeErr
+	}
+
+	return newObjectRecord(
+		bucket,
+		s.config.Dedup.BlobBucket,
+		s.config.Dedup.BlobPrefix+hash,
+		before,
+		hash,
+		s.config.Dedup.HashAlgo,
+		before.Size,
+		scanID,
+		cache.ObjectStateReported,
+	), nil
+}
+
+func (s *Scanner) processObject(
+	ctx context.Context,
+	bucket string,
+	info minio.ObjectInfo,
+	scanID string,
+) error {
+	record, err := s.discoverObject(ctx, bucket, info, scanID)
 	if err != nil {
 		return err
 	}
-	if statObj.ContentType == pointer.ContentPointerType {
-		s.logging.Debugf("Object %s/%s is a pointer\n", bucket, info.Key)
-		return s.processPointer(ctx, bucket, info, scanID)
-	}
-
-	obj, err := s.s3Client.GetObject(ctx, bucket, info.Key)
-	if err != nil {
-		return err
-	}
-	defer obj.Close()
-
-	hash, err := hashing.HashReader(obj, s.config.Dedup.HashAlgo)
-	if err != nil {
-		return err
-	}
-
-	err = s.register(ctx, bucket, s.config.Dedup.BlobBucket, s.config.Dedup.BlobPrefix+hash, info, hash, s.config.Dedup.HashAlgo, info.Size, scanID, cache.ObjectStateReported)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return s.store.RegisterObject(ctx, record)
 }
 
 func (s *Scanner) blobMutex(blobBucket, blobKey string) *sync.Mutex {
@@ -221,11 +241,15 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 	if err != nil {
 		return 0, false, err
 	}
+	if isObjectChanged(info, statObj) {
+		s.logging.Debugf("Object %s/%s changed after discovery and will be retried on the next scan\n", bucket, info.Key)
+		return 0, false, nil
+	}
 	if statObj.ContentType == pointer.ContentPointerType {
-		return 0, false, s.processPointer(ctx, bucket, info, scanID)
+		return 0, false, s.processPointer(ctx, bucket, statObj, scanID)
 	}
 
-	obj, err := s.s3Client.GetObject(ctx, bucket, info.Key)
+	obj, err := s.s3Client.GetObject(ctx, bucket, statObj.Key)
 	if err != nil {
 		return 0, false, err
 	}
@@ -244,11 +268,11 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 	}
 
 	logicalBucket := bucket
-	logicalKey := info.Key
+	logicalKey := statObj.Key
 	blobBucket := s.config.Dedup.BlobBucket
 	blobKey := s.config.Dedup.BlobPrefix + hash
 
-	reclaimed, err := s.createBlob(ctx, hash, temp, info.Size, info.ContentType)
+	reclaimed, err := s.createBlob(ctx, hash, temp, statObj.Size, statObj.ContentType)
 	if err != nil {
 		return 0, false, err
 	}
@@ -262,10 +286,10 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 	relinked := false
 	flagChanged := isObjectChanged(statObj, isChanged)
 	if s.config.Dedup.DeleteOriginals && !flagChanged {
-		s.logging.Infof("Replacing object %s/%s with pointer", bucket, info.Key)
-		res, err = s.safeReplace(ctx, bucket, blobBucket, info, hash)
+		s.logging.Debugf("Replacing object %s/%s with pointer", bucket, statObj.Key)
+		res, err = s.safeReplace(ctx, bucket, blobBucket, statObj, hash)
 		if err != nil {
-			return 0, false, fmt.Errorf("processObjectPointer %q/%q: %w", bucket, info.Key, err)
+			return 0, false, fmt.Errorf("processObjectPointer %q/%q: %w", bucket, statObj.Key, err)
 		}
 		relinked = true
 	}
@@ -276,12 +300,12 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 	}
 
 	if !flagChanged {
-		err = s.register(ctx, logicalBucket, blobBucket, blobKey, res, hash, s.config.Dedup.HashAlgo, info.Size, scanID, state)
+		err = s.register(ctx, logicalBucket, blobBucket, blobKey, res, hash, s.config.Dedup.HashAlgo, statObj.Size, scanID, state)
 		if err != nil {
 			return 0, false, err
 		}
 	}
-	return info.Size - res.Size + reclaimed, relinked, nil
+	return statObj.Size - res.Size + reclaimed, relinked, nil
 }
 
 func (s *Scanner) createBlob(ctx context.Context, hash string, temp *os.File, size int64, contentType string) (int64, error) {
@@ -327,42 +351,63 @@ func (s *Scanner) createBlob(ctx context.Context, hash string, temp *os.File, si
 	return reclaimed, nil
 }
 
-func (s *Scanner) processPointer(ctx context.Context, bucket string, info minio.ObjectInfo, scanID string) error {
+func (s *Scanner) discoverPointer(
+	ctx context.Context,
+	bucket string,
+	info minio.ObjectInfo,
+	scanID string,
+) (cache.ObjectRecord, error) {
 	obj, err := s.s3Client.GetObject(ctx, bucket, info.Key)
 	if err != nil {
-		return err
+		return cache.ObjectRecord{}, err
 	}
-	defer obj.Close()
+	p, readErr := pointer.ReadPointer(obj)
+	closeErr := obj.Close()
+	if readErr != nil {
+		return cache.ObjectRecord{}, readErr
+	}
+	if closeErr != nil {
+		return cache.ObjectRecord{}, closeErr
+	}
 
-	p, err := pointer.ReadPointer(obj)
-	if err != nil {
-		return err
-	}
 	logicalInfo := info
 	if p.HashAlgo != s.config.Dedup.HashAlgo {
 		p, logicalInfo, err = s.migratePointerHash(ctx, bucket, info, p)
 		if err != nil {
-			return err
+			return cache.ObjectRecord{}, err
 		}
 	}
 	if p.BlobKey != s.config.Dedup.BlobPrefix+p.Hash {
-		return fmt.Errorf("Pointer key %q does not match %q", p.BlobKey, s.config.Dedup.BlobPrefix+p.Hash)
+		return cache.ObjectRecord{}, fmt.Errorf("Pointer key %q does not match %q", p.BlobKey, s.config.Dedup.BlobPrefix+p.Hash)
 	}
 
 	statInfo, err := s.s3Client.StatObject(ctx, p.BlobBucket, p.BlobKey)
 	if err != nil {
-		return err
+		return cache.ObjectRecord{}, err
 	}
 	if !comparePointerObject(p, statInfo) {
-		return fmt.Errorf("%q/%q: Pointer-object mismatch", bucket, info.Key)
+		return cache.ObjectRecord{}, fmt.Errorf("%q/%q: Pointer-object mismatch", bucket, info.Key)
 	}
 
-	err = s.register(ctx, bucket, p.BlobBucket, p.BlobKey, logicalInfo, p.Hash, p.HashAlgo, p.Size, scanID, cache.ObjectStatePointer)
+	return newObjectRecord(
+		bucket,
+		p.BlobBucket,
+		p.BlobKey,
+		logicalInfo,
+		p.Hash,
+		p.HashAlgo,
+		p.Size,
+		scanID,
+		cache.ObjectStatePointer,
+	), nil
+}
+
+func (s *Scanner) processPointer(ctx context.Context, bucket string, info minio.ObjectInfo, scanID string) error {
+	record, err := s.discoverPointer(ctx, bucket, info, scanID)
 	if err != nil {
 		return err
 	}
-
-	return nil
+	return s.store.RegisterObject(ctx, record)
 }
 
 func (s *Scanner) migratePointerHash(ctx context.Context, bucket string, info minio.ObjectInfo, p *pointer.Pointer) (*pointer.Pointer, minio.ObjectInfo, error) {
@@ -553,8 +598,7 @@ func comparePointerObject(pointer *pointer.Pointer, obj minio.ObjectInfo) bool {
 	return true
 }
 
-func (s *Scanner) register(
-	ctx context.Context,
+func newObjectRecord(
 	bucket string,
 	blobBucket string,
 	blobKey string,
@@ -564,8 +608,8 @@ func (s *Scanner) register(
 	blobSize int64,
 	scanID string,
 	state cache.ObjectState,
-) error {
-	record := cache.ObjectRecord{
+) cache.ObjectRecord {
+	return cache.ObjectRecord{
 		Bucket:       bucket,
 		BlobBucket:   blobBucket,
 		BlobKey:      blobKey,
@@ -579,12 +623,31 @@ func (s *Scanner) register(
 		LastSeenScan: scanID,
 		State:        state,
 	}
+}
 
-	err := s.store.RegisterObject(ctx, record)
-	if err != nil {
-		return err
-	}
-	return nil
+func (s *Scanner) register(
+	ctx context.Context,
+	bucket string,
+	blobBucket string,
+	blobKey string,
+	info minio.ObjectInfo,
+	hash string,
+	hashAlgo string,
+	blobSize int64,
+	scanID string,
+	state cache.ObjectState,
+) error {
+	return s.store.RegisterObject(ctx, newObjectRecord(
+		bucket,
+		blobBucket,
+		blobKey,
+		info,
+		hash,
+		hashAlgo,
+		blobSize,
+		scanID,
+		state,
+	))
 }
 
 func desiredPointerState(deleteOriginals bool) cache.ObjectState {

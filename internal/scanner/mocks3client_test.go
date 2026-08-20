@@ -27,6 +27,7 @@ type mockS3Client struct {
 	statHooks   map[string]func(*mockS3Client, int)
 	listErr     error
 	listHook    func(processed int)
+	listCalls   int
 	removeErrs  map[string]map[string]error
 	removeCalls map[string][][]string
 }
@@ -38,11 +39,12 @@ func (m *mockS3Client) ListObjects(
 	recursive bool,
 	fn func(minio.ObjectInfo) error,
 ) error {
-	m.mu.RLock()
+	m.mu.Lock()
+	m.listCalls++
 	listErr := m.listErr
 	listHook := m.listHook
 	objects := append([]minio.ObjectInfo(nil), m.objects...)
-	m.mu.RUnlock()
+	m.mu.Unlock()
 
 	if listErr != nil {
 		return listErr

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"s3-dedup/internal/cache"
 	"s3-dedup/internal/pointer"
@@ -13,11 +14,9 @@ import (
 	"github.com/minio/minio-go/v6"
 )
 
-type pointerPhase uint8
-
 const (
-	pointerDiscovery pointerPhase = iota
-	pointerDeduplication
+	discoveryBatchSize = 1000
+	candidatePageSize  = 1000
 )
 
 func (s *Scanner) scanPointer(
@@ -27,12 +26,17 @@ func (s *Scanner) scanPointer(
 	workers int64,
 	scanID string,
 ) error {
-	if err := s.pointerLap(ctx, atomics, workers, scanID, pointerDiscovery); err != nil {
+	discoveryStarted := time.Now()
+	if err := s.pointerDiscovery(ctx, atomics, workers, scanID); err != nil {
 		return err
 	}
-	if err := s.pointerLap(ctx, atomics, workers, scanID, pointerDeduplication); err != nil {
+	s.logging.Infof("Pointer discovery completed in %s\n", time.Since(discoveryStarted))
+
+	deduplicationStarted := time.Now()
+	if err := s.pointerDeduplication(ctx, atomics, workers, scanID); err != nil {
 		return err
 	}
+	s.logging.Infof("Pointer deduplication completed in %s\n", time.Since(deduplicationStarted))
 
 	if atomics.processErrors.Load() == 0 && scanReport.Errors == 0 {
 		gcBytes, removedBlobs, err := s.collectGarbage(ctx)
@@ -53,13 +57,19 @@ func (s *Scanner) scanPointer(
 	return nil
 }
 
-func (s *Scanner) pointerLap(
+func (s *Scanner) pointerDiscovery(
 	ctx context.Context,
 	atomics *atomicReportPart,
 	workers int64,
 	scanID string,
-	phase pointerPhase,
 ) error {
+	discoveryCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	mutations := make(chan cache.DiscoveryMutation, discoveryBatchSize*2)
+	writerErr := make(chan error, 1)
+	go s.runDiscoveryWriter(discoveryCtx, cancel, mutations, writerErr)
+
 	jobs := make(chan objectJob, workers)
 	var workersWG sync.WaitGroup
 	for i := 0; i < int(workers); i++ {
@@ -67,47 +77,53 @@ func (s *Scanner) pointerLap(
 		go func() {
 			defer workersWG.Done()
 			for job := range jobs {
-				var processErr error
-				switch phase {
-				case pointerDiscovery:
-					processErr = s.processObject(ctx, job.buket, job.info, job.scanID)
-				case pointerDeduplication:
-					var reclaimed int64
-					var relinked bool
-					reclaimed, relinked, processErr = s.processObjectPointer(ctx, job.buket, job.info, job.scanID)
-					if s.config.Dedup.DeleteOriginals && processErr == nil {
-						if relinked {
-							atomics.objectsRelinked.Add(1)
-						}
-						atomics.bytesReclaimed.Add(reclaimed)
-					}
-				}
-				if processErr != nil {
+				record, err := s.discoverObject(discoveryCtx, job.buket, job.info, job.scanID)
+				if err != nil {
 					atomics.processErrors.Add(1)
-					s.logging.Errorf("Processing object %s/%s: %v\n", job.buket, job.info.Key, processErr)
+					s.logging.Errorf("Discovering object %s/%s: %v\n", job.buket, job.info.Key, err)
+					s.sendDiscoveryMutation(discoveryCtx, mutations, cache.DiscoveryMutation{
+						Kind: cache.DiscoveryMarkSeen,
+						ID: cache.ObjectID{
+							Bucket: job.buket,
+							Key:    job.info.Key,
+							ScanID: job.scanID,
+						},
+					})
+					continue
+				}
+				if !s.sendDiscoveryMutation(discoveryCtx, mutations, cache.DiscoveryMutation{
+					Kind:   cache.DiscoveryRegister,
+					Object: record,
+				}) {
+					return
 				}
 			}
 		}()
 	}
 
+	var listErr error
 	for _, bucket := range s.config.S3.Buckets {
-		err := s.s3Client.ListObjects(ctx, bucket.Name, bucket.Prefix, true, func(info minio.ObjectInfo) error {
+		listErr = s.s3Client.ListObjects(discoveryCtx, bucket.Name, bucket.Prefix, true, func(info minio.ObjectInfo) error {
 			if strings.HasPrefix(info.Key, s.config.Dedup.BlobPrefix) {
 				return nil
 			}
+			atomics.objectsScanned.Add(1)
 
-			if phase == pointerDiscovery {
-				if err := s.store.MarkObjectSeen(ctx, bucket.Name, info.Key, scanID); err != nil {
-					return fmt.Errorf("MarkObjectSeen error for %q: %w", info.Key, err)
+			if info.Size < s.config.Dedup.MinSizeBytes && info.ContentType != pointer.ContentPointerType {
+				if !s.sendDiscoveryMutation(discoveryCtx, mutations, cache.DiscoveryMutation{
+					Kind: cache.DiscoveryUnregister,
+					ID: cache.ObjectID{
+						Bucket: bucket.Name,
+						Key:    info.Key,
+					},
+				}) {
+					return discoveryCtx.Err()
 				}
-				if info.Size < s.config.Dedup.MinSizeBytes && info.ContentType != pointer.ContentPointerType {
-					return s.store.UnregisterObject(ctx, bucket.Name, info.Key)
-				}
-				atomics.objectsScanned.Add(1)
+				return nil
 			}
 
 			status, err := s.store.GetObjectStatus(
-				ctx,
+				discoveryCtx,
 				bucket.Name,
 				info.Key,
 				info.ETag,
@@ -118,53 +134,170 @@ func (s *Scanner) pointerLap(
 			if err != nil {
 				return fmt.Errorf("GetObjectStatus %q/%q: %w", bucket.Name, info.Key, err)
 			}
-
-			switch phase {
-			case pointerDiscovery:
-				if status.Unchanged && stateRank(status.State) >= stateRank(cache.ObjectStateReported) {
-					s.logging.Debugf("Object %s/%s skipped because already discovered\n", bucket.Name, info.Key)
-					return nil
+			if status.Unchanged && stateRank(status.State) >= stateRank(cache.ObjectStateReported) {
+				if !s.sendDiscoveryMutation(discoveryCtx, mutations, cache.DiscoveryMutation{
+					Kind: cache.DiscoveryMarkSeen,
+					ID: cache.ObjectID{
+						Bucket: bucket.Name,
+						Key:    info.Key,
+						ScanID: scanID,
+					},
+				}) {
+					return discoveryCtx.Err()
 				}
-			case pointerDeduplication:
-				if !status.Unchanged {
-					s.logging.Debugf("Object %s/%s skipped because it changed after discovery\n", bucket.Name, info.Key)
-					return nil
-				}
-				if status.RefCount <= 1 {
-					s.logging.Debugf("Object %s/%s skipped because ref_count = %d\n", bucket.Name, info.Key, status.RefCount)
-					return nil
-				}
-				if stateRank(status.State) >= stateRank(desiredPointerState(s.config.Dedup.DeleteOriginals)) {
-					s.logging.Debugf("Object %s/%s skipped because unchanged and ready\n", bucket.Name, info.Key)
-					return nil
-				}
+				return nil
 			}
 
 			select {
 			case jobs <- objectJob{buket: bucket.Name, info: info, scanID: scanID}:
 				return nil
-			case <-ctx.Done():
-				return ctx.Err()
+			case <-discoveryCtx.Done():
+				return discoveryCtx.Err()
 			}
 		})
-		if err != nil {
-			close(jobs)
-			workersWG.Wait()
-			return fmt.Errorf("listing objects in %q: %w", bucket.Name, err)
+		if listErr != nil {
+			break
+		}
+	}
+
+	close(jobs)
+	workersWG.Wait()
+	close(mutations)
+	batchErr := <-writerErr
+	s.clearBlobLocks()
+
+	if batchErr != nil {
+		return batchErr
+	}
+	if listErr != nil {
+		return fmt.Errorf("listing objects: %w", listErr)
+	}
+	for _, bucket := range s.config.S3.Buckets {
+		if _, err := s.store.FinalizeScope(ctx, bucket.Name, bucket.Prefix, scanID); err != nil {
+			return fmt.Errorf("FinalizeScope for %q/%q: %w", bucket.Name, bucket.Prefix, err)
+		}
+	}
+	return nil
+}
+
+func (s *Scanner) runDiscoveryWriter(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	mutations <-chan cache.DiscoveryMutation,
+	result chan<- error,
+) {
+	batch := make([]cache.DiscoveryMutation, 0, discoveryBatchSize)
+	var batchErr error
+	flush := func() {
+		if len(batch) == 0 || batchErr != nil {
+			return
+		}
+		if err := s.store.ApplyDiscoveryBatch(ctx, batch); err != nil {
+			batchErr = fmt.Errorf("apply discovery batch: %w", err)
+			cancel()
+		}
+		batch = batch[:0]
+	}
+
+	for mutation := range mutations {
+		if batchErr != nil {
+			continue
+		}
+		batch = append(batch, mutation)
+		if len(batch) == cap(batch) {
+			flush()
+		}
+	}
+	flush()
+	result <- batchErr
+}
+
+func (s *Scanner) sendDiscoveryMutation(
+	ctx context.Context,
+	mutations chan<- cache.DiscoveryMutation,
+	mutation cache.DiscoveryMutation,
+) bool {
+	select {
+	case mutations <- mutation:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (s *Scanner) pointerDeduplication(
+	ctx context.Context,
+	atomics *atomicReportPart,
+	workers int64,
+	scanID string,
+) error {
+	jobs := make(chan objectJob, workers)
+	var candidatesQueued int64
+	var workersWG sync.WaitGroup
+	for i := 0; i < int(workers); i++ {
+		workersWG.Add(1)
+		go func() {
+			defer workersWG.Done()
+			for job := range jobs {
+				reclaimed, relinked, processErr := s.processObjectPointer(ctx, job.buket, job.info, job.scanID)
+				if processErr != nil {
+					atomics.processErrors.Add(1)
+					s.logging.Errorf("Processing duplicate %s/%s: %v\n", job.buket, job.info.Key, processErr)
+					continue
+				}
+				if s.config.Dedup.DeleteOriginals {
+					if relinked {
+						atomics.objectsRelinked.Add(1)
+					}
+					atomics.bytesReclaimed.Add(reclaimed)
+				}
+			}
+		}()
+	}
+
+	for _, bucket := range s.config.S3.Buckets {
+		afterKey := ""
+		for {
+			candidates, err := s.store.ListDedupCandidates(
+				ctx,
+				bucket.Name,
+				bucket.Prefix,
+				desiredPointerState(s.config.Dedup.DeleteOriginals),
+				afterKey,
+				candidatePageSize,
+			)
+			if err != nil {
+				close(jobs)
+				workersWG.Wait()
+				return err
+			}
+			if len(candidates) == 0 {
+				break
+			}
+			for _, candidate := range candidates {
+				info := minio.ObjectInfo{
+					Key:          candidate.Key,
+					ETag:         candidate.ETag,
+					Size:         candidate.Size,
+					LastModified: candidate.LastModified,
+				}
+				select {
+				case jobs <- objectJob{buket: candidate.Bucket, info: info, scanID: scanID}:
+					candidatesQueued++
+				case <-ctx.Done():
+					close(jobs)
+					workersWG.Wait()
+					return ctx.Err()
+				}
+			}
+			afterKey = candidates[len(candidates)-1].Key
 		}
 	}
 
 	close(jobs)
 	workersWG.Wait()
 	s.clearBlobLocks()
-
-	if phase == pointerDiscovery {
-		for _, bucket := range s.config.S3.Buckets {
-			if _, err := s.store.FinalizeScope(ctx, bucket.Name, bucket.Prefix, scanID); err != nil {
-				return fmt.Errorf("FinalizeScope for %q/%q: %w", bucket.Name, bucket.Prefix, err)
-			}
-		}
-	}
+	s.logging.Infof("Pointer deduplication candidates: %d\n", candidatesQueued)
 	return nil
 }
 
