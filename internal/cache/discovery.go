@@ -8,8 +8,6 @@ import (
 	"time"
 )
 
-const sqliteTimeFormat = "2006-01-02T15:04:05.999999999Z07:00"
-
 func (s *SQLiteStore) ApplyDiscoveryBatch(ctx context.Context, mutations []DiscoveryMutation) error {
 	if len(mutations) == 0 {
 		return nil
@@ -76,7 +74,7 @@ func applyRegisterMutation(ctx context.Context, tx *sql.Tx, object ObjectRecord)
 			object.Key,
 			object.ETag,
 			object.Size,
-			object.LastModified.UTC().Format(sqliteTimeFormat),
+			formatObjectTime(object.LastModified),
 			object.BlobBucket,
 			object.Hash,
 			object.HashAlgo,
@@ -95,7 +93,7 @@ func applyRegisterMutation(ctx context.Context, tx *sql.Tx, object ObjectRecord)
 		`,
 			object.ETag,
 			object.Size,
-			object.LastModified.UTC().Format(sqliteTimeFormat),
+			formatObjectTime(object.LastModified),
 			object.LastSeenScan,
 			object.State,
 			object.HashAlgo,
@@ -118,7 +116,7 @@ func applyRegisterMutation(ctx context.Context, tx *sql.Tx, object ObjectRecord)
 		`,
 			object.ETag,
 			object.Size,
-			object.LastModified.UTC().Format(sqliteTimeFormat),
+			formatObjectTime(object.LastModified),
 			object.BlobBucket,
 			object.Hash,
 			object.LastSeenScan,

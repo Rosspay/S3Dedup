@@ -581,7 +581,7 @@ func (s *Scanner) collectGarbage(ctx context.Context) (int64, int64, error) {
 func isObjectChanged(objBefore minio.ObjectInfo, objAfter minio.ObjectInfo) bool {
 	if objBefore.ETag != objAfter.ETag ||
 		objBefore.Size != objAfter.Size ||
-		objBefore.LastModified != objAfter.LastModified {
+		objBefore.LastModified.UTC().Truncate(time.Second) != objAfter.LastModified.UTC().Truncate(time.Second) {
 		return true
 	}
 	return false

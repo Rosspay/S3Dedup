@@ -77,7 +77,7 @@ func (c *Client) ListObjects(ctx context.Context, bucket string, prefix string, 
 }
 
 func (c *Client) GetObject(ctx context.Context, bucket string, key string) (io.ReadCloser, error) {
-	c.logging.Infof("Getting object %s from bucket %s\n", key, bucket)
+	c.logging.Debugf("Getting object %s from bucket %s\n", key, bucket)
 	obj, err := c.S3Client.GetObjectWithContext(ctx, bucket, key, minio.GetObjectOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("Get object %q: %w", key, err)
@@ -86,7 +86,7 @@ func (c *Client) GetObject(ctx context.Context, bucket string, key string) (io.R
 }
 
 func (c *Client) StatObject(ctx context.Context, bucket string, objectName string) (minio.ObjectInfo, error) {
-	c.logging.Infof("StatObject %s, from bucket %s\n", objectName, bucket)
+	c.logging.Debugf("StatObject %s, from bucket %s\n", objectName, bucket)
 	obj, err := c.S3Client.StatObjectWithContext(ctx, bucket, objectName, minio.StatObjectOptions{})
 	if err != nil {
 		return minio.ObjectInfo{}, err
@@ -102,7 +102,7 @@ func (c *Client) PutObject(
 	size int64,
 	contentType string,
 ) (int64, error) {
-	c.logging.Infof("PutObject %s, size %d in bucket %s\n", objectName, size, bucket)
+	c.logging.Debugf("PutObject %s, size %d in bucket %s\n", objectName, size, bucket)
 	n, err := c.S3Client.PutObjectWithContext(ctx, bucket, objectName, reader, size, minio.PutObjectOptions{ContentType: contentType})
 	if err != nil {
 		return 0, fmt.Errorf("PutObject error: %w", err)
@@ -115,7 +115,7 @@ func (c *Client) RemoveObjects(
 	bucket string,
 	keys []string,
 ) ([]string, error) {
-	c.logging.Infof("RemoveObjects from bucket %s", bucket)
+	c.logging.Debugf("RemoveObjects from bucket %s", bucket)
 	objectsCh := make(chan string, len(keys))
 	for _, key := range keys {
 		objectsCh <- key

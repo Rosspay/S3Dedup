@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"s3-dedup/internal/cache"
 
@@ -63,6 +64,48 @@ func TestPointerModeListsS3Once(t *testing.T) {
 	client.mu.RUnlock()
 	if listCalls != len(cfg.S3.Buckets) {
 		t.Fatalf("ListObjects calls = %d, expected %d", listCalls, len(cfg.S3.Buckets))
+	}
+}
+
+func TestPointerModeAcceptsListAndStatTimestampPrecisionDifference(t *testing.T) {
+	const content = "unique content"
+	listed := objectInfo("one.txt", int64(len(content)))
+	listed.LastModified = listed.LastModified.Add(789 * time.Millisecond)
+	stat := listed
+	stat.LastModified = stat.LastModified.Truncate(time.Second)
+	client := &mockS3Client{
+		objects: []minio.ObjectInfo{listed},
+		contents: map[string]string{
+			objectID("bucket", listed.Key): content,
+		},
+		stats: map[string]minio.ObjectInfo{
+			objectID("bucket", listed.Key): stat,
+		},
+	}
+	store := openTestStore(t)
+	cfg := pointerTestConfig()
+
+	result, err := newTestScanner(t, client, store, cfg).ScanOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ScanOnce error: %v", err)
+	}
+	if result.Errors != 0 || result.UniqueBlobs != 1 {
+		t.Fatalf("result = %+v, expected one unique object without errors", result)
+	}
+	status, err := store.GetObjectStatus(
+		context.Background(),
+		"bucket",
+		listed.Key,
+		listed.ETag,
+		listed.Size,
+		cfg.Dedup.HashAlgo,
+		listed.LastModified,
+	)
+	if err != nil {
+		t.Fatalf("GetObjectStatus error: %v", err)
+	}
+	if !status.Unchanged {
+		t.Fatalf("status = %+v, expected cached object to be unchanged", status)
 	}
 }
 

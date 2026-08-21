@@ -221,6 +221,29 @@ func TestGetObjectStatusReturnsStateAndGroupRefCount(t *testing.T) {
 	}
 }
 
+func TestGetObjectStatusNormalizesLastModifiedToSeconds(t *testing.T) {
+	store := openTestStore(t)
+	object := record("bucket", "one.txt", "hash", 100)
+	object.LastModified = object.LastModified.Add(123 * time.Millisecond)
+	register(t, store, object)
+
+	status, err := store.GetObjectStatus(
+		context.Background(),
+		object.Bucket,
+		object.Key,
+		object.ETag,
+		object.Size,
+		object.HashAlgo,
+		object.LastModified.Add(700*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("GetObjectStatus error: %v", err)
+	}
+	if !status.Unchanged {
+		t.Errorf("status = %+v, expected sub-second timestamp difference to be ignored", status)
+	}
+}
+
 func TestGetObjectStatusDifferentHashAlgorithmIsChanged(t *testing.T) {
 	store := openTestStore(t)
 	object := record("bucket", "one.txt", "hash", 100)

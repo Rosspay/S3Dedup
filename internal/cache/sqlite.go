@@ -12,8 +12,14 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+const sqliteTimeFormat = "2006-01-02T15:04:05.999999999Z07:00"
+
 type SQLiteStore struct {
 	db *sql.DB
+}
+
+func formatObjectTime(value time.Time) string {
+	return value.UTC().Truncate(time.Second).Format(sqliteTimeFormat)
 }
 
 func OpenSQLite(path string) (*SQLiteStore, error) {
@@ -119,7 +125,7 @@ func (s *SQLiteStore) RegisterObject(ctx context.Context, object ObjectRecord) e
 			object.Key,
 			object.ETag,
 			object.Size,
-			object.LastModified.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"),
+			formatObjectTime(object.LastModified),
 			object.BlobBucket,
 			object.Hash,
 			object.HashAlgo,
@@ -138,7 +144,7 @@ func (s *SQLiteStore) RegisterObject(ctx context.Context, object ObjectRecord) e
 		`,
 			object.ETag,
 			object.Size,
-			object.LastModified.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"),
+			formatObjectTime(object.LastModified),
 			object.LastSeenScan,
 			object.State,
 			object.HashAlgo,
@@ -161,7 +167,7 @@ func (s *SQLiteStore) RegisterObject(ctx context.Context, object ObjectRecord) e
 		`,
 			object.ETag,
 			object.Size,
-			object.LastModified.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"),
+			formatObjectTime(object.LastModified),
 			object.BlobBucket,
 			object.Hash,
 			object.LastSeenScan,
@@ -243,7 +249,7 @@ func (s *SQLiteStore) GetObjectStatus(
 	AND o.hash_algo = ?
 	AND o.last_modified = ?
 	`
-	err = s.db.QueryRowContext(ctx, query, bucket, key, etag, size, hashAlgo, lastModified.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")).Scan(&status.State, &status.RefCount)
+	err = s.db.QueryRowContext(ctx, query, bucket, key, etag, size, hashAlgo, formatObjectTime(lastModified)).Scan(&status.State, &status.RefCount)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return ObjectStatus{}, nil
