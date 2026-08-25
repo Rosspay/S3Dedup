@@ -236,35 +236,44 @@ func (s *Scanner) CleanupTempFiles(maxAge time.Duration) (int, error) {
 	)
 }
 
-func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info minio.ObjectInfo, scanID string) (int64, bool, error) {
+func (s *Scanner) processObjectPointer(
+	ctx context.Context,
+	bucket string,
+	info minio.ObjectInfo,
+	scanID string,
+) (pointerDedupResult, error) {
 	statObj, err := s.s3Client.StatObject(ctx, bucket, info.Key)
 	if err != nil {
-		return 0, false, err
+		return pointerDedupResult{}, err
 	}
 	if isObjectChanged(info, statObj) {
 		s.logging.Debugf("Object %s/%s changed after discovery and will be retried on the next scan\n", bucket, info.Key)
-		return 0, false, nil
+		return pointerDedupResult{}, nil
 	}
 	if statObj.ContentType == pointer.ContentPointerType {
-		return 0, false, s.processPointer(ctx, bucket, statObj, scanID)
+		record, err := s.discoverPointer(ctx, bucket, statObj, scanID)
+		if err != nil {
+			return pointerDedupResult{}, err
+		}
+		return pointerDedupResult{record: &record}, nil
 	}
 
 	obj, err := s.s3Client.GetObject(ctx, bucket, statObj.Key)
 	if err != nil {
-		return 0, false, err
+		return pointerDedupResult{}, err
 	}
 	defer obj.Close()
 
 	temp, err := s.createTempFile()
 	if err != nil {
-		return 0, false, err
+		return pointerDedupResult{}, err
 	}
 	defer s.removeTempFile(temp)
 
 	tee := io.TeeReader(obj, temp)
 	hash, err := hashing.HashReader(tee, s.config.Dedup.HashAlgo)
 	if err != nil {
-		return 0, false, err
+		return pointerDedupResult{}, err
 	}
 
 	logicalBucket := bucket
@@ -274,12 +283,12 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 
 	reclaimed, err := s.createBlob(ctx, hash, temp, statObj.Size, statObj.ContentType)
 	if err != nil {
-		return 0, false, err
+		return pointerDedupResult{}, err
 	}
 
 	isChanged, err := s.s3Client.StatObject(ctx, logicalBucket, logicalKey)
 	if err != nil {
-		return 0, false, err
+		return pointerDedupResult{}, err
 	}
 
 	res := statObj
@@ -289,23 +298,36 @@ func (s *Scanner) processObjectPointer(ctx context.Context, bucket string, info 
 		s.logging.Debugf("Replacing object %s/%s with pointer", bucket, statObj.Key)
 		res, err = s.safeReplace(ctx, bucket, blobBucket, statObj, hash)
 		if err != nil {
-			return 0, false, fmt.Errorf("processObjectPointer %q/%q: %w", bucket, statObj.Key, err)
+			return pointerDedupResult{}, fmt.Errorf("processObjectPointer %q/%q: %w", bucket, statObj.Key, err)
 		}
 		relinked = true
+	}
+
+	result := pointerDedupResult{
+		reclaimed: statObj.Size - res.Size + reclaimed,
+		relinked:  relinked,
+	}
+	if flagChanged {
+		return result, nil
 	}
 
 	state := cache.ObjectStateBlobReady
 	if relinked {
 		state = cache.ObjectStatePointer
 	}
-
-	if !flagChanged {
-		err = s.register(ctx, logicalBucket, blobBucket, blobKey, res, hash, s.config.Dedup.HashAlgo, statObj.Size, scanID, state)
-		if err != nil {
-			return 0, false, err
-		}
-	}
-	return statObj.Size - res.Size + reclaimed, relinked, nil
+	record := newObjectRecord(
+		logicalBucket,
+		blobBucket,
+		blobKey,
+		res,
+		hash,
+		s.config.Dedup.HashAlgo,
+		statObj.Size,
+		scanID,
+		state,
+	)
+	result.record = &record
+	return result, nil
 }
 
 func (s *Scanner) createBlob(ctx context.Context, hash string, temp *os.File, size int64, contentType string) (int64, error) {

@@ -15,9 +15,23 @@ import (
 )
 
 const (
-	discoveryBatchSize = 1000
-	candidatePageSize  = 1000
+	discoveryBatchSize      = 1000
+	dedupBatchSize          = 100
+	dedupBatchFlushInterval = 100 * time.Millisecond
+	candidatePageSize       = 1000
 )
+
+type pointerDedupJob struct {
+	objectJob
+	completed *sync.WaitGroup
+}
+
+type pointerDedupResult struct {
+	record    *cache.ObjectRecord
+	reclaimed int64
+	relinked  bool
+	completed *sync.WaitGroup
+}
 
 func (s *Scanner) scanPointer(
 	ctx context.Context,
@@ -47,7 +61,11 @@ func (s *Scanner) scanPointer(
 		s.logging.Infof("Blobs removed: %d, bytes reclaimed: %d\n", removedBlobs, gcBytes)
 	}
 
-	stats, err := s.store.GetStats(ctx)
+	scopes := make([]cache.Scope, 0, len(s.config.S3.Buckets))
+	for _, bucket := range s.config.S3.Buckets {
+		scopes = append(scopes, cache.Scope{Bucket: bucket.Name, Prefix: bucket.Prefix})
+	}
+	stats, err := s.store.GetStats(ctx, scopes...)
 	if err != nil {
 		return fmt.Errorf("GetStats error: %w", err)
 	}
@@ -231,7 +249,11 @@ func (s *Scanner) pointerDeduplication(
 	workers int64,
 	scanID string,
 ) error {
-	jobs := make(chan objectJob, workers)
+	jobs := make(chan pointerDedupJob, workers)
+	results := make(chan pointerDedupResult, dedupBatchSize*2)
+	writerDone := make(chan struct{})
+	go s.runDedupWriter(ctx, results, atomics, writerDone)
+
 	var candidatesQueued int64
 	var workersWG sync.WaitGroup
 	for i := 0; i < int(workers); i++ {
@@ -239,20 +261,30 @@ func (s *Scanner) pointerDeduplication(
 		go func() {
 			defer workersWG.Done()
 			for job := range jobs {
-				reclaimed, relinked, processErr := s.processObjectPointer(ctx, job.buket, job.info, job.scanID)
+				result, processErr := s.processObjectPointer(ctx, job.buket, job.info, job.scanID)
 				if processErr != nil {
 					atomics.processErrors.Add(1)
 					s.logging.Errorf("Processing duplicate %s/%s: %v\n", job.buket, job.info.Key, processErr)
+					job.completed.Done()
 					continue
 				}
-				if s.config.Dedup.DeleteOriginals {
-					if relinked {
-						atomics.objectsRelinked.Add(1)
-					}
-					atomics.bytesReclaimed.Add(reclaimed)
+				result.completed = job.completed
+				select {
+				case results <- result:
+				case <-ctx.Done():
+					job.completed.Done()
+					return
 				}
 			}
 		}()
+	}
+
+	shutdown := func() {
+		close(jobs)
+		workersWG.Wait()
+		close(results)
+		<-writerDone
+		s.clearBlobLocks()
 	}
 
 	for _, bucket := range s.config.S3.Buckets {
@@ -267,14 +299,16 @@ func (s *Scanner) pointerDeduplication(
 				candidatePageSize,
 			)
 			if err != nil {
-				close(jobs)
-				workersWG.Wait()
+				shutdown()
 				return err
 			}
 			if len(candidates) == 0 {
 				break
 			}
+
+			var pageWG sync.WaitGroup
 			for _, candidate := range candidates {
+				pageWG.Add(1)
 				info := minio.ObjectInfo{
 					Key:          candidate.Key,
 					ETag:         candidate.ETag,
@@ -282,23 +316,95 @@ func (s *Scanner) pointerDeduplication(
 					LastModified: candidate.LastModified,
 				}
 				select {
-				case jobs <- objectJob{buket: candidate.Bucket, info: info, scanID: scanID}:
+				case jobs <- pointerDedupJob{
+					objectJob: objectJob{buket: candidate.Bucket, info: info, scanID: scanID},
+					completed: &pageWG,
+				}:
 					candidatesQueued++
 				case <-ctx.Done():
-					close(jobs)
-					workersWG.Wait()
+					pageWG.Done()
+					shutdown()
 					return ctx.Err()
 				}
+			}
+			pageWG.Wait()
+			if err := ctx.Err(); err != nil {
+				shutdown()
+				return err
 			}
 			afterKey = candidates[len(candidates)-1].Key
 		}
 	}
 
-	close(jobs)
-	workersWG.Wait()
-	s.clearBlobLocks()
+	shutdown()
 	s.logging.Infof("Pointer deduplication candidates: %d\n", candidatesQueued)
 	return nil
+}
+
+func (s *Scanner) runDedupWriter(
+	ctx context.Context,
+	results <-chan pointerDedupResult,
+	atomics *atomicReportPart,
+	done chan<- struct{},
+) {
+	defer close(done)
+	ticker := time.NewTicker(dedupBatchFlushInterval)
+	defer ticker.Stop()
+
+	batch := make([]pointerDedupResult, 0, dedupBatchSize)
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+
+		records := make([]cache.ObjectRecord, len(batch))
+		for index, result := range batch {
+			records[index] = *result.record
+		}
+		if err := s.store.ApplyDedupBatch(ctx, records); err != nil {
+			atomics.processErrors.Add(int64(len(batch)))
+			s.logging.Errorf("Applying pointer deduplication batch of %d objects: %v\n", len(batch), err)
+		} else {
+			for _, result := range batch {
+				s.applyDedupMetrics(atomics, result)
+			}
+		}
+		for _, result := range batch {
+			result.completed.Done()
+		}
+		batch = batch[:0]
+	}
+
+	for {
+		select {
+		case result, ok := <-results:
+			if !ok {
+				flush()
+				return
+			}
+			if result.record == nil {
+				s.applyDedupMetrics(atomics, result)
+				result.completed.Done()
+				continue
+			}
+			batch = append(batch, result)
+			if len(batch) == cap(batch) {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
+	}
+}
+
+func (s *Scanner) applyDedupMetrics(atomics *atomicReportPart, result pointerDedupResult) {
+	if !s.config.Dedup.DeleteOriginals {
+		return
+	}
+	if result.relinked {
+		atomics.objectsRelinked.Add(1)
+	}
+	atomics.bytesReclaimed.Add(result.reclaimed)
 }
 
 func (s *Scanner) clearBlobLocks() {

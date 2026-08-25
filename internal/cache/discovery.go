@@ -51,6 +51,34 @@ func (s *SQLiteStore) ApplyDiscoveryBatch(ctx context.Context, mutations []Disco
 	return nil
 }
 
+func (s *SQLiteStore) ApplyDedupBatch(ctx context.Context, objects []ObjectRecord) error {
+	if len(objects) == 0 {
+		return nil
+	}
+	for _, object := range objects {
+		if err := validateObject(object); err != nil {
+			return err
+		}
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("apply dedup batch: begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	for _, object := range objects {
+		if err := applyRegisterMutation(ctx, tx, object); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("apply dedup batch: commit: %w", err)
+	}
+	return nil
+}
+
 func applyRegisterMutation(ctx context.Context, tx *sql.Tx, object ObjectRecord) error {
 	var oldBlobBucket string
 	var oldHash string

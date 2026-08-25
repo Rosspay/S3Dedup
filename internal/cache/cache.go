@@ -8,7 +8,6 @@ import (
 type Store interface {
 	RegisterObject(ctx context.Context, object ObjectRecord) error
 	UnregisterObject(ctx context.Context, bucket string, key string) error
-	//IsObjectUnchanged(ctx context.Context, bucket, key, etag string, size int64, lastModified time.Time) (bool, bool, error)
 	GetObjectStatus(
 		ctx context.Context,
 		bucket string,
@@ -19,6 +18,7 @@ type Store interface {
 		lastModified time.Time,
 	) (status ObjectStatus, err error)
 	ApplyDiscoveryBatch(ctx context.Context, mutations []DiscoveryMutation) error
+	ApplyDedupBatch(ctx context.Context, objects []ObjectRecord) error
 	ListDedupCandidates(
 		ctx context.Context,
 		bucket string,
@@ -27,7 +27,7 @@ type Store interface {
 		afterKey string,
 		limit int,
 	) ([]DedupCandidate, error)
-	GetStats(ctx context.Context) (Stats, error)
+	GetStats(ctx context.Context, scopes ...Scope) (Stats, error)
 	MarkObjectSeen(ctx context.Context, bucket, key, scanID string) error
 	FinalizeScope(ctx context.Context, bucket, prefix, scanID string) (removed int64, err error)
 	ListUnreferencedBlobs(ctx context.Context, bucket string) (blobList []BlobRecord, err error)
@@ -97,6 +97,11 @@ type BlobRecord struct {
 	Key    string
 	Hash   string
 	Size   int64
+}
+
+type Scope struct {
+	Bucket string
+	Prefix string
 }
 
 type Stats struct {

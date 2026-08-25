@@ -293,6 +293,70 @@ func TestRegisterObjectSameBlobUpdatesStateAndHashAlgorithm(t *testing.T) {
 	}
 }
 
+func TestApplyDedupBatchRollsBackAllRecordsOnError(t *testing.T) {
+	store := openTestStore(t)
+	first := record("bucket", "one.txt", "first-hash", 100)
+	second := record("bucket", "two.txt", "second-hash", 200)
+	register(t, store, first)
+	register(t, store, second)
+
+	secondHash := second.Hash
+	first.State = ObjectStatePointer
+	second.Hash = first.Hash
+	second.BlobKey = first.BlobKey
+	if err := store.ApplyDedupBatch(context.Background(), []ObjectRecord{first, second}); err == nil {
+		t.Fatal("ApplyDedupBatch error = nil, expected blob size mismatch")
+	}
+
+	var state ObjectState
+	if err := store.db.QueryRow(`
+		SELECT object_state
+		FROM objects
+		WHERE bucket = ? AND object_key = ?
+	`, first.Bucket, first.Key).Scan(&state); err != nil {
+		t.Fatalf("read first object state: %v", err)
+	}
+	if state != ObjectStateReported {
+		t.Errorf("first object state = %q, expected transaction rollback to %q", state, ObjectStateReported)
+	}
+	assertRefCount(t, store, first.BlobBucket, first.Hash, 1)
+	assertRefCount(t, store, second.BlobBucket, secondHash, 1)
+}
+
+func TestGetStatsFiltersConfiguredScopes(t *testing.T) {
+	store := openTestStore(t)
+	register(t, store, record("first-bucket", "current/one.txt", "first-hash", 100))
+	register(t, store, record("first-bucket", "current/two.txt", "first-hash", 100))
+	firstShared := record("first-bucket", "other/one.txt", "shared-hash", 200)
+	firstShared.BlobBucket = "blob-bucket"
+	register(t, store, firstShared)
+	secondShared := record("second-bucket", "current/one.txt", "shared-hash", 200)
+	secondShared.BlobBucket = "blob-bucket"
+	register(t, store, secondShared)
+
+	stats, err := store.GetStats(context.Background(), Scope{Bucket: "first-bucket", Prefix: "current/"})
+	if err != nil {
+		t.Fatalf("GetStats error: %v", err)
+	}
+	expected := Stats{UniqueBlobs: 1, DuplicatesFound: 1, BytesReclaimable: 100}
+	if stats != expected {
+		t.Errorf("GetStats = %+v, expected %+v", stats, expected)
+	}
+
+	stats, err = store.GetStats(
+		context.Background(),
+		Scope{Bucket: "first-bucket", Prefix: "other/"},
+		Scope{Bucket: "second-bucket", Prefix: "current/"},
+	)
+	if err != nil {
+		t.Fatalf("GetStats for multiple scopes error: %v", err)
+	}
+	expected = Stats{UniqueBlobs: 1, DuplicatesFound: 1, BytesReclaimable: 200}
+	if stats != expected {
+		t.Errorf("GetStats for multiple scopes = %+v, expected %+v", stats, expected)
+	}
+}
+
 func TestGetStatsTracksOnlyRemainingOriginalObjects(t *testing.T) {
 	tests := []struct {
 		name     string

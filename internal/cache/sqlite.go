@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -354,8 +355,12 @@ func decrementBlob(ctx context.Context, tx *sql.Tx, bucket string, hash string) 
 }
 
 // Getting required stats for report
-func (s *SQLiteStore) GetStats(ctx context.Context) (Stats, error) {
-	const query = `
+func (s *SQLiteStore) GetStats(ctx context.Context, scopes ...Scope) (Stats, error) {
+	where, args, err := statsScopeFilter(scopes)
+	if err != nil {
+		return Stats{}, err
+	}
+	query := `
 		WITH groups AS (
 			SELECT
 				o.blob_bucket,
@@ -374,6 +379,7 @@ func (s *SQLiteStore) GetStats(ctx context.Context) (Stats, error) {
 			JOIN blobs AS b
 			ON b.bucket = o.blob_bucket
 			AND b.hash = o.blob_hash
+			` + where + `
 			GROUP BY o.blob_bucket, o.blob_hash, b.size
 		)
 		SELECT
@@ -390,7 +396,7 @@ func (s *SQLiteStore) GetStats(ctx context.Context) (Stats, error) {
 		FROM groups
 	`
 	var stats Stats
-	if err := s.db.QueryRowContext(ctx, query).Scan(
+	if err := s.db.QueryRowContext(ctx, query, args...).Scan(
 		&stats.UniqueBlobs,
 		&stats.DuplicatesFound,
 		&stats.BytesReclaimable,
@@ -398,6 +404,23 @@ func (s *SQLiteStore) GetStats(ctx context.Context) (Stats, error) {
 		return Stats{}, fmt.Errorf("Error getting stats: %w", err)
 	}
 	return stats, nil
+}
+
+func statsScopeFilter(scopes []Scope) (string, []interface{}, error) {
+	if len(scopes) == 0 {
+		return "", nil, nil
+	}
+
+	conditions := make([]string, 0, len(scopes))
+	args := make([]interface{}, 0, len(scopes)*3)
+	for _, scope := range scopes {
+		if scope.Bucket == "" {
+			return "", nil, fmt.Errorf("get stats: scope bucket is empty")
+		}
+		conditions = append(conditions, `(o.bucket = ? AND substr(o.object_key, 1, length(?)) = ?)`)
+		args = append(args, scope.Bucket, scope.Prefix, scope.Prefix)
+	}
+	return "WHERE " + strings.Join(conditions, " OR "), args, nil
 }
 
 // Marking object anyway

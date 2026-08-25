@@ -7,10 +7,12 @@ s3:
   secret_key: "password"
   use_path_style: true
   buckets:
-  - name: "unique-bucket"
-    prefix: ""
-  #- name: "next-bucket"
-  #  prefix: "next-prefix/"
+  #- name: "my-bucket"
+  #  prefix: "my-prefix"
+  - name: "next-bucket"
+    prefix: "next-prefix/"
+  #- name: "unique-bucket"
+  #  prefix: ""
 dedup:
   hash_algo: "sha256"
   min_size_bytes: 0 #
@@ -25,5 +27,5 @@ schedule:
   scan_interval: "1h" #
   workers: 16 #
 logging:
-  level: "error"
+  level: "info"
   file: "service.log"

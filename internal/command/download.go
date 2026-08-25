@@ -9,7 +9,6 @@ import (
 	"s3-dedup/internal/config"
 	"s3-dedup/internal/downloader"
 	"s3-dedup/internal/logger"
-	"s3-dedup/internal/pointer"
 	"s3-dedup/internal/s3"
 	"strings"
 
@@ -40,8 +39,8 @@ func waitForNextPage(reader *bufio.Reader) (bool, error) {
 	}
 }
 
-var listPointers = &cobra.Command{
-	Use:   "list-pointers",
+var listObjects = &cobra.Command{
+	Use:   "list-objects",
 	Short: "Lists objects in bucket stated",
 	Long:  "Lists objects in bucket stated",
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -73,9 +72,6 @@ var listPointers = &cobra.Command{
 			statInfo, statErr := originalsClient.StatObject(ctx, bucketName, info.Key)
 			if statErr != nil {
 				return statErr
-			}
-			if statInfo.ContentType != pointer.ContentPointerType {
-				return nil
 			}
 			if objectsOnPage == pageSize {
 				proceed, err := waitForNextPage(reader)
@@ -146,9 +142,9 @@ var downloadObject = &cobra.Command{
 
 func init() {
 
-	listPointers.Flags().StringVarP(&bucketName, "name", "n", "", "Bucket name to list objects from")
-	listPointers.MarkFlagRequired("name")
-	listPointers.Flags().StringVarP(&prefixName, "prefix", "p", "", "Prefix in a bucket")
+	listObjects.Flags().StringVarP(&bucketName, "name", "n", "", "Bucket name to list objects from")
+	listObjects.MarkFlagRequired("name")
+	listObjects.Flags().StringVarP(&prefixName, "prefix", "p", "", "Prefix in a bucket")
 
 	downloadObject.Flags().StringVarP(&bucketName, "name", "n", "", "Bucket containing the object")
 	downloadObject.MarkFlagRequired("name")
@@ -156,6 +152,6 @@ func init() {
 	downloadObject.MarkFlagRequired("key")
 	downloadObject.Flags().StringVarP(&downloadPath, "path", "p", "", "Directory to download the object to")
 
-	rootCmd.AddCommand(listPointers)
+	rootCmd.AddCommand(listObjects)
 	rootCmd.AddCommand(downloadObject)
 }

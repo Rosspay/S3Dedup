@@ -13,7 +13,7 @@ import (
 	"github.com/minio/minio-go/v6"
 )
 
-type failRegisterStore struct {
+type failDedupStore struct {
 	cache.Store
 	mu        sync.Mutex
 	remaining int
@@ -22,16 +22,18 @@ type failRegisterStore struct {
 	err       error
 }
 
-func (s *failRegisterStore) RegisterObject(ctx context.Context, object cache.ObjectRecord) error {
+func (s *failDedupStore) ApplyDedupBatch(ctx context.Context, objects []cache.ObjectRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.remaining > 0 &&
-		(s.state == "" || object.State == s.state) &&
-		(s.key == "" || object.Key == s.key) {
-		s.remaining--
-		return s.err
+	for _, object := range objects {
+		if s.remaining > 0 &&
+			(s.state == "" || object.State == s.state) &&
+			(s.key == "" || object.Key == s.key) {
+			s.remaining--
+			return s.err
+		}
 	}
-	return s.Store.RegisterObject(ctx, object)
+	return s.Store.ApplyDedupBatch(ctx, objects)
 }
 
 func TestPointerModePointerSurvivesCacheFailureAndRestoresReference(t *testing.T) {
@@ -53,7 +55,7 @@ func TestPointerModePointerSurvivesCacheFailureAndRestoresReference(t *testing.T
 			objectID("bucket", secondKey): content,
 		},
 	}
-	failingStore := &failRegisterStore{
+	failingStore := &failDedupStore{
 		Store:     store,
 		remaining: 1,
 		state:     cache.ObjectStatePointer,
@@ -65,8 +67,15 @@ func TestPointerModePointerSurvivesCacheFailureAndRestoresReference(t *testing.T
 	if err != nil {
 		t.Fatalf("first ScanOnce error: %v", err)
 	}
-	if firstResult.Errors != 1 {
-		t.Errorf("first Errors = %d, expected 1", firstResult.Errors)
+	if firstResult.Errors != 2 {
+		t.Errorf("first Errors = %d, expected 2", firstResult.Errors)
+	}
+	if firstResult.ObjectsRelinked != 0 || firstResult.BytesReclaimed != 0 {
+		t.Errorf(
+			"failed batch metrics = relinked %d, reclaimed %d; expected zero",
+			firstResult.ObjectsRelinked,
+			firstResult.BytesReclaimed,
+		)
 	}
 	for _, key := range []string{firstKey, secondKey} {
 		if got := client.stats[objectID("bucket", key)].ContentType; got != pointer.ContentPointerType {
