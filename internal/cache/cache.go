@@ -65,10 +65,15 @@ type DiscoveryMutation struct {
 
 type DedupCandidate struct {
 	Bucket       string
+	BlobBucket   string
+	BlobKey      string
 	Key          string
 	ETag         string
 	Size         int64
+	BlobSize     int64
 	LastModified time.Time
+	Hash         string
+	HashAlgo     string
 }
 
 type ObjectRecord struct {

@@ -9,8 +9,8 @@ s3:
   buckets:
   #- name: "my-bucket"
   #  prefix: "my-prefix"
-  - name: "next-bucket"
-    prefix: "next-prefix/"
+  - name: "single-copy-bucket"
+    prefix: "single_copy/"
   #- name: "unique-bucket"
   #  prefix: ""
 dedup:

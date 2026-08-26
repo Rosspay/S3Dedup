@@ -23,6 +23,8 @@ type mockS3Client struct {
 	statErrors  map[string]error
 	putErrors   map[string]error
 	putCalls    map[string]int
+	getCalls    map[string]int
+	getHooks    map[string]func(*mockS3Client, int)
 	statCalls   map[string]int
 	statHooks   map[string]func(*mockS3Client, int)
 	listErr     error
@@ -86,12 +88,20 @@ func (m *mockS3Client) GetObject(
 	}
 
 	id := objectID(bucket, key)
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if err := m.errors[id]; err != nil {
+	m.mu.Lock()
+	if m.getCalls == nil {
+		m.getCalls = make(map[string]int)
+	}
+	m.getCalls[id]++
+	if hook := m.getHooks[id]; hook != nil {
+		hook(m, m.getCalls[id])
+	}
+	err := m.errors[id]
+	content, ok := m.contents[id]
+	m.mu.Unlock()
+	if err != nil {
 		return nil, err
 	}
-	content, ok := m.contents[id]
 	if !ok {
 		return nil, fmt.Errorf("object %q/%q not found", bucket, key)
 	}
@@ -258,6 +268,28 @@ func (m *mockS3Client) putCallCount(bucket, key string) int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.putCalls[objectID(bucket, key)]
+}
+
+func (m *mockS3Client) getCallCount(bucket, key string) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.getCalls[objectID(bucket, key)]
+}
+
+func (m *mockS3Client) statCallCount(bucket, key string) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.statCalls[objectID(bucket, key)]
+}
+
+func (m *mockS3Client) totalGetCalls() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var total int
+	for _, calls := range m.getCalls {
+		total += calls
+	}
+	return total
 }
 
 func (m *mockS3Client) totalPutCalls() int {

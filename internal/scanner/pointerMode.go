@@ -22,7 +22,8 @@ const (
 )
 
 type pointerDedupJob struct {
-	objectJob
+	candidate cache.DedupCandidate
+	scanID    string
 	completed *sync.WaitGroup
 }
 
@@ -31,6 +32,32 @@ type pointerDedupResult struct {
 	reclaimed int64
 	relinked  bool
 	completed *sync.WaitGroup
+}
+
+type dedupBlobCoordinator struct {
+	locks sync.Map
+	ready sync.Map
+}
+
+func dedupBlobID(bucket, key string) string {
+	return bucket + "\x00" + key
+}
+
+func (c *dedupBlobCoordinator) mutex(bucket, key string) *sync.Mutex {
+	mu, _ := c.locks.LoadOrStore(dedupBlobID(bucket, key), &sync.Mutex{})
+	return mu.(*sync.Mutex)
+}
+
+func (c *dedupBlobCoordinator) readySize(bucket, key string) (int64, bool) {
+	size, ok := c.ready.Load(dedupBlobID(bucket, key))
+	if !ok {
+		return 0, false
+	}
+	return size.(int64), true
+}
+
+func (c *dedupBlobCoordinator) markReady(bucket, key string, size int64) {
+	c.ready.Store(dedupBlobID(bucket, key), size)
 }
 
 func (s *Scanner) scanPointer(
@@ -255,16 +282,22 @@ func (s *Scanner) pointerDeduplication(
 	go s.runDedupWriter(ctx, results, atomics, writerDone)
 
 	var candidatesQueued int64
+	blobs := &dedupBlobCoordinator{}
 	var workersWG sync.WaitGroup
 	for i := 0; i < int(workers); i++ {
 		workersWG.Add(1)
 		go func() {
 			defer workersWG.Done()
 			for job := range jobs {
-				result, processErr := s.processObjectPointer(ctx, job.buket, job.info, job.scanID)
+				result, processErr := s.processObjectPointer(ctx, job.candidate, job.scanID, blobs)
 				if processErr != nil {
 					atomics.processErrors.Add(1)
-					s.logging.Errorf("Processing duplicate %s/%s: %v\n", job.buket, job.info.Key, processErr)
+					s.logging.Errorf(
+						"Processing duplicate %s/%s: %v\n",
+						job.candidate.Bucket,
+						job.candidate.Key,
+						processErr,
+					)
 					job.completed.Done()
 					continue
 				}
@@ -309,15 +342,10 @@ func (s *Scanner) pointerDeduplication(
 			var pageWG sync.WaitGroup
 			for _, candidate := range candidates {
 				pageWG.Add(1)
-				info := minio.ObjectInfo{
-					Key:          candidate.Key,
-					ETag:         candidate.ETag,
-					Size:         candidate.Size,
-					LastModified: candidate.LastModified,
-				}
 				select {
 				case jobs <- pointerDedupJob{
-					objectJob: objectJob{buket: candidate.Bucket, info: info, scanID: scanID},
+					candidate: candidate,
+					scanID:    scanID,
 					completed: &pageWG,
 				}:
 					candidatesQueued++

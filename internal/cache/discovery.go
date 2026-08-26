@@ -230,7 +230,17 @@ func (s *SQLiteStore) ListDedupCandidates(
 	}
 
 	query := `
-		SELECT o.bucket, o.object_key, o.etag, o.size, o.last_modified
+		SELECT
+			o.bucket,
+			o.blob_bucket,
+			b.blob_key,
+			o.object_key,
+			o.etag,
+			o.size,
+			b.size,
+			o.last_modified,
+			o.blob_hash,
+			o.hash_algo
 		FROM objects AS o
 		JOIN blobs AS b
 		ON b.bucket = o.blob_bucket
@@ -255,10 +265,15 @@ func (s *SQLiteStore) ListDedupCandidates(
 		var lastModified string
 		if err := rows.Scan(
 			&candidate.Bucket,
+			&candidate.BlobBucket,
+			&candidate.BlobKey,
 			&candidate.Key,
 			&candidate.ETag,
 			&candidate.Size,
+			&candidate.BlobSize,
 			&lastModified,
+			&candidate.Hash,
+			&candidate.HashAlgo,
 		); err != nil {
 			return nil, fmt.Errorf("scan dedup candidate: %w", err)
 		}

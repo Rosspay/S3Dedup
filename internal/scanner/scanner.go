@@ -7,6 +7,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"s3-dedup/internal/cache"
 	"s3-dedup/internal/config"
 	"s3-dedup/internal/hashing"
@@ -14,11 +19,6 @@ import (
 	"s3-dedup/internal/pointer"
 	"s3-dedup/internal/report"
 	"s3-dedup/internal/tempfiles"
-	"sync"
-	"sync/atomic"
-
-	"strconv"
-	"time"
 
 	"github.com/minio/minio-go/v6"
 )
@@ -238,96 +238,257 @@ func (s *Scanner) CleanupTempFiles(maxAge time.Duration) (int, error) {
 
 func (s *Scanner) processObjectPointer(
 	ctx context.Context,
-	bucket string,
-	info minio.ObjectInfo,
+	candidate cache.DedupCandidate,
 	scanID string,
+	blobs *dedupBlobCoordinator,
 ) (pointerDedupResult, error) {
-	statObj, err := s.s3Client.StatObject(ctx, bucket, info.Key)
+	discovered := minio.ObjectInfo{
+		Key:          candidate.Key,
+		ETag:         candidate.ETag,
+		Size:         candidate.Size,
+		LastModified: candidate.LastModified,
+	}
+	statObj, err := s.s3Client.StatObject(ctx, candidate.Bucket, candidate.Key)
 	if err != nil {
 		return pointerDedupResult{}, err
 	}
-	if isObjectChanged(info, statObj) {
-		s.logging.Debugf("Object %s/%s changed after discovery and will be retried on the next scan\n", bucket, info.Key)
+	if isObjectChanged(discovered, statObj) {
+		s.logging.Debugf(
+			"Object %s/%s changed after discovery and will be retried on the next scan\n",
+			candidate.Bucket,
+			candidate.Key,
+		)
 		return pointerDedupResult{}, nil
 	}
 	if statObj.ContentType == pointer.ContentPointerType {
-		record, err := s.discoverPointer(ctx, bucket, statObj, scanID)
+		record, err := s.discoverPointer(ctx, candidate.Bucket, statObj, scanID)
 		if err != nil {
 			return pointerDedupResult{}, err
 		}
 		return pointerDedupResult{record: &record}, nil
 	}
-
-	obj, err := s.s3Client.GetObject(ctx, bucket, statObj.Key)
-	if err != nil {
-		return pointerDedupResult{}, err
+	if candidate.HashAlgo != s.config.Dedup.HashAlgo {
+		return pointerDedupResult{}, fmt.Errorf(
+			"dedup candidate %q/%q hash algorithm is %q, expected %q",
+			candidate.Bucket,
+			candidate.Key,
+			candidate.HashAlgo,
+			s.config.Dedup.HashAlgo,
+		)
 	}
-	defer obj.Close()
-
-	temp, err := s.createTempFile()
-	if err != nil {
-		return pointerDedupResult{}, err
-	}
-	defer s.removeTempFile(temp)
-
-	tee := io.TeeReader(obj, temp)
-	hash, err := hashing.HashReader(tee, s.config.Dedup.HashAlgo)
-	if err != nil {
-		return pointerDedupResult{}, err
+	if candidate.BlobSize != statObj.Size {
+		return pointerDedupResult{}, fmt.Errorf(
+			"dedup candidate %q/%q size %d does not match blob size %d",
+			candidate.Bucket,
+			candidate.Key,
+			statObj.Size,
+			candidate.BlobSize,
+		)
 	}
 
-	logicalBucket := bucket
-	logicalKey := statObj.Key
 	blobBucket := s.config.Dedup.BlobBucket
-	blobKey := s.config.Dedup.BlobPrefix + hash
-
-	reclaimed, err := s.createBlob(ctx, hash, temp, statObj.Size, statObj.ContentType)
+	blobKey := s.config.Dedup.BlobPrefix + candidate.Hash
+	reclaimed, stable, err := s.materializeCandidateBlob(
+		ctx,
+		candidate,
+		statObj,
+		blobBucket,
+		blobKey,
+		blobs,
+	)
 	if err != nil {
 		return pointerDedupResult{}, err
 	}
-
-	isChanged, err := s.s3Client.StatObject(ctx, logicalBucket, logicalKey)
-	if err != nil {
-		return pointerDedupResult{}, err
-	}
-
-	res := statObj
-	relinked := false
-	flagChanged := isObjectChanged(statObj, isChanged)
-	if s.config.Dedup.DeleteOriginals && !flagChanged {
-		s.logging.Debugf("Replacing object %s/%s with pointer", bucket, statObj.Key)
-		res, err = s.safeReplace(ctx, bucket, blobBucket, statObj, hash)
-		if err != nil {
-			return pointerDedupResult{}, fmt.Errorf("processObjectPointer %q/%q: %w", bucket, statObj.Key, err)
-		}
-		relinked = true
-	}
-
-	result := pointerDedupResult{
-		reclaimed: statObj.Size - res.Size + reclaimed,
-		relinked:  relinked,
-	}
-	if flagChanged {
+	result := pointerDedupResult{reclaimed: reclaimed}
+	if !stable {
 		return result, nil
 	}
 
+	current, err := s.s3Client.StatObject(ctx, candidate.Bucket, candidate.Key)
+	if err != nil {
+		return pointerDedupResult{}, err
+	}
+	if isObjectChanged(statObj, current) {
+		s.logging.Debugf(
+			"Object %s/%s changed during deduplication and will be retried on the next scan\n",
+			candidate.Bucket,
+			candidate.Key,
+		)
+		return result, nil
+	}
+
+	res := statObj
+	if s.config.Dedup.DeleteOriginals {
+		s.logging.Debugf("Replacing object %s/%s with pointer", candidate.Bucket, candidate.Key)
+		res, err = s.safeReplace(
+			ctx,
+			candidate.Bucket,
+			blobBucket,
+			statObj,
+			candidate.Hash,
+		)
+		if err != nil {
+			return pointerDedupResult{}, fmt.Errorf(
+				"processObjectPointer %q/%q: %w",
+				candidate.Bucket,
+				candidate.Key,
+				err,
+			)
+		}
+		result.relinked = true
+	}
+	result.reclaimed += statObj.Size - res.Size
+
 	state := cache.ObjectStateBlobReady
-	if relinked {
+	if result.relinked {
 		state = cache.ObjectStatePointer
 	}
 	record := newObjectRecord(
-		logicalBucket,
+		candidate.Bucket,
 		blobBucket,
 		blobKey,
 		res,
-		hash,
-		s.config.Dedup.HashAlgo,
-		statObj.Size,
+		candidate.Hash,
+		candidate.HashAlgo,
+		candidate.BlobSize,
 		scanID,
 		state,
 	)
 	result.record = &record
 	return result, nil
+}
+
+func (s *Scanner) materializeCandidateBlob(
+	ctx context.Context,
+	candidate cache.DedupCandidate,
+	source minio.ObjectInfo,
+	blobBucket string,
+	blobKey string,
+	blobs *dedupBlobCoordinator,
+) (int64, bool, error) {
+	if readySize, ok := blobs.readySize(blobBucket, blobKey); ok {
+		if readySize != candidate.BlobSize {
+			return 0, false, fmt.Errorf(
+				"consistency error: blob %q size %d does not match candidate size %d",
+				blobKey,
+				readySize,
+				candidate.BlobSize,
+			)
+		}
+		return 0, true, nil
+	}
+
+	mu := blobs.mutex(blobBucket, blobKey)
+	mu.Lock()
+	defer mu.Unlock()
+	if readySize, ok := blobs.readySize(blobBucket, blobKey); ok {
+		if readySize != candidate.BlobSize {
+			return 0, false, fmt.Errorf(
+				"consistency error: blob %q size %d does not match candidate size %d",
+				blobKey,
+				readySize,
+				candidate.BlobSize,
+			)
+		}
+		return 0, true, nil
+	}
+
+	blobInfo, err := s.s3Client.StatObject(ctx, blobBucket, blobKey)
+	switch {
+	case err == nil:
+		if blobInfo.Size != candidate.BlobSize {
+			return 0, false, fmt.Errorf(
+				"consistency error: blob %q size mismatch",
+				blobKey,
+			)
+		}
+		blobs.markReady(blobBucket, blobKey, blobInfo.Size)
+		return 0, true, nil
+	case minio.ToErrorResponse(err).Code != "NoSuchKey":
+		return 0, false, fmt.Errorf(
+			"StatObject for blob %q: %w",
+			blobKey,
+			err,
+		)
+	}
+
+	obj, err := s.s3Client.GetObject(ctx, candidate.Bucket, candidate.Key)
+	if err != nil {
+		return 0, false, err
+	}
+	temp, err := s.createTempFile()
+	if err != nil {
+		obj.Close()
+		return 0, false, err
+	}
+	defer s.removeTempFile(temp)
+
+	hash, hashErr := hashing.HashReader(io.TeeReader(obj, temp), candidate.HashAlgo)
+	closeErr := obj.Close()
+	if hashErr != nil {
+		return 0, false, hashErr
+	}
+	if closeErr != nil {
+		return 0, false, closeErr
+	}
+	if hash != candidate.Hash {
+		return 0, false, fmt.Errorf(
+			"consistency error: object %q/%q hash changed without metadata change",
+			candidate.Bucket,
+			candidate.Key,
+		)
+	}
+	tempInfo, err := temp.Stat()
+	if err != nil {
+		return 0, false, err
+	}
+	if tempInfo.Size() != candidate.BlobSize {
+		return 0, false, fmt.Errorf(
+			"consistency error: object %q/%q content size %d does not match expected size %d",
+			candidate.Bucket,
+			candidate.Key,
+			tempInfo.Size(),
+			candidate.BlobSize,
+		)
+	}
+
+	current, err := s.s3Client.StatObject(ctx, candidate.Bucket, candidate.Key)
+	if err != nil {
+		return 0, false, err
+	}
+	if isObjectChanged(source, current) {
+		s.logging.Debugf(
+			"Object %s/%s changed while materializing its blob and will be retried on the next scan\n",
+			candidate.Bucket,
+			candidate.Key,
+		)
+		return 0, false, nil
+	}
+	if _, err := temp.Seek(0, io.SeekStart); err != nil {
+		return 0, false, err
+	}
+	n, err := s.s3Client.PutObject(
+		ctx,
+		blobBucket,
+		blobKey,
+		temp,
+		candidate.BlobSize,
+		source.ContentType,
+	)
+	if err != nil {
+		return 0, false, err
+	}
+	if n != candidate.BlobSize {
+		return 0, false, fmt.Errorf(
+			"consistency error: PutObject for blob %q wrote %d bytes, expected %d",
+			blobKey,
+			n,
+			candidate.BlobSize,
+		)
+	}
+	blobs.markReady(blobBucket, blobKey, n)
+	s.logging.Debugf("Blob %s of size %d was put\n", blobKey, n)
+	return -n, true, nil
 }
 
 func (s *Scanner) createBlob(ctx context.Context, hash string, temp *os.File, size int64, contentType string) (int64, error) {

@@ -65,6 +65,13 @@ func TestListDedupCandidatesFiltersStateAndPaginates(t *testing.T) {
 	if len(page) != 1 || page[0].Key != first.Key {
 		t.Fatalf("first page = %+v, expected %q", page, first.Key)
 	}
+	if candidate := page[0]; candidate.BlobBucket != first.BlobBucket ||
+		candidate.BlobKey != first.BlobKey ||
+		candidate.Hash != first.Hash ||
+		candidate.HashAlgo != first.HashAlgo ||
+		candidate.BlobSize != first.BlobSize {
+		t.Fatalf("first candidate blob metadata = %+v, expected %+v", candidate, first)
+	}
 	page, err = store.ListDedupCandidates(ctx, "bucket", "prefix/", ObjectStatePointer, page[0].Key, 10)
 	if err != nil {
 		t.Fatalf("ListDedupCandidates second page error: %v", err)

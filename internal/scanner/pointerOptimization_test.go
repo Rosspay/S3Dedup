@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"s3-dedup/internal/cache"
+	"s3-dedup/internal/config"
+	"s3-dedup/internal/pointer"
 
 	"github.com/minio/minio-go/v6"
 )
@@ -210,6 +212,222 @@ func TestPointerModeBatchesDeduplicationCacheUpdates(t *testing.T) {
 	}
 	if got := countingStore.registerCalls.Load(); got != 0 {
 		t.Fatalf("individual RegisterObject calls = %d, expected 0", got)
+	}
+}
+
+func TestPointerDeduplicationDownloadsOneRepresentativePerBlobAcrossBuckets(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	cfg := pointerTestConfig()
+	cfg.S3.Buckets = []config.Bucket{
+		{Name: "first-bucket"},
+		{Name: "second-bucket"},
+	}
+	cfg.Dedup.BlobBucket = "blob-bucket"
+	cfg.Dedup.DeleteOriginals = true
+
+	type logicalObject struct {
+		bucket  string
+		key     string
+		content string
+	}
+	objects := []logicalObject{
+		{bucket: "first-bucket", key: "alpha-one.txt", content: "alpha content"},
+		{bucket: "first-bucket", key: "alpha-two.txt", content: "alpha content"},
+		{bucket: "second-bucket", key: "alpha-three.txt", content: "alpha content"},
+		{bucket: "second-bucket", key: "beta-one.txt", content: "beta content"},
+		{bucket: "second-bucket", key: "beta-two.txt", content: "beta content"},
+	}
+	client := &mockS3Client{contents: make(map[string]string)}
+	for _, object := range objects {
+		info := objectInfo(object.key, int64(len(object.content)))
+		client.contents[objectID(object.bucket, object.key)] = object.content
+		hash := hashContent(t, object.content)
+		record := record(object.bucket, object.key, hash, info.Size)
+		record.BlobBucket = cfg.Dedup.BlobBucket
+		record.BlobKey = cfg.Dedup.BlobPrefix + hash
+		record.ETag = info.ETag
+		record.LastModified = info.LastModified
+		if err := store.RegisterObject(ctx, record); err != nil {
+			t.Fatalf("RegisterObject %q/%q: %v", object.bucket, object.key, err)
+		}
+	}
+
+	atomics := &atomicReportPart{}
+	scanner := newTestScanner(t, client, store, cfg)
+	if err := scanner.pointerDeduplication(ctx, atomics, 4, "scan-2"); err != nil {
+		t.Fatalf("pointerDeduplication error: %v", err)
+	}
+	if atomics.processErrors.Load() != 0 {
+		t.Fatalf("processErrors = %d, expected 0", atomics.processErrors.Load())
+	}
+	if got := client.totalGetCalls(); got != 2 {
+		t.Fatalf("GetObject calls = %d, expected one representative for each of two blobs", got)
+	}
+	for _, content := range []string{"alpha content", "beta content"} {
+		blobKey := cfg.Dedup.BlobPrefix + hashContent(t, content)
+		if got := client.statCallCount(cfg.Dedup.BlobBucket, blobKey); got != 1 {
+			t.Errorf("StatObject calls for blob %q = %d, expected 1", blobKey, got)
+		}
+	}
+	for _, object := range objects {
+		if got := objectContentType(t, client, object.bucket, object.key); got != pointer.ContentPointerType {
+			t.Errorf("ContentType for %q/%q = %q, expected pointer", object.bucket, object.key, got)
+		}
+	}
+}
+
+func TestPointerDeduplicationDoesNotDownloadCandidatesWhenBlobExists(t *testing.T) {
+	const content = "already materialized content"
+	ctx := context.Background()
+	store := openTestStore(t)
+	cfg := pointerTestConfig()
+	cfg.Dedup.BlobBucket = "blob-bucket"
+	cfg.Dedup.DeleteOriginals = true
+	hash := hashContent(t, content)
+	blobKey := cfg.Dedup.BlobPrefix + hash
+	client := &mockS3Client{contents: map[string]string{
+		objectID(cfg.Dedup.BlobBucket, blobKey): content,
+	}}
+	for _, key := range []string{"one.txt", "two.txt", "three.txt"} {
+		info := objectInfo(key, int64(len(content)))
+		client.contents[objectID("bucket", key)] = content
+		record := record("bucket", key, hash, info.Size)
+		record.BlobBucket = cfg.Dedup.BlobBucket
+		record.BlobKey = blobKey
+		record.ETag = info.ETag
+		record.LastModified = info.LastModified
+		if err := store.RegisterObject(ctx, record); err != nil {
+			t.Fatalf("RegisterObject %q: %v", key, err)
+		}
+	}
+
+	atomics := &atomicReportPart{}
+	if err := newTestScanner(t, client, store, cfg).pointerDeduplication(ctx, atomics, 3, "scan-2"); err != nil {
+		t.Fatalf("pointerDeduplication error: %v", err)
+	}
+	if atomics.processErrors.Load() != 0 {
+		t.Fatalf("processErrors = %d, expected 0", atomics.processErrors.Load())
+	}
+	if got := client.totalGetCalls(); got != 0 {
+		t.Fatalf("GetObject calls = %d, expected 0 for an existing blob", got)
+	}
+	if got := client.putCallCount(cfg.Dedup.BlobBucket, blobKey); got != 0 {
+		t.Fatalf("blob PutObject calls = %d, expected 0", got)
+	}
+	if got := client.statCallCount(cfg.Dedup.BlobBucket, blobKey); got != 1 {
+		t.Fatalf("blob StatObject calls = %d, expected one shared existence check", got)
+	}
+	for _, key := range []string{"one.txt", "two.txt", "three.txt"} {
+		if got := objectContentType(t, client, "bucket", key); got != pointer.ContentPointerType {
+			t.Errorf("ContentType for %q = %q, expected pointer", key, got)
+		}
+	}
+}
+
+func TestPointerDeduplicationDoesNotTrustHashAfterMetadataChange(t *testing.T) {
+	const content = "stable duplicate content"
+	ctx := context.Background()
+	store := openTestStore(t)
+	cfg := pointerTestConfig()
+	cfg.Dedup.DeleteOriginals = true
+	hash := hashContent(t, content)
+	client := &mockS3Client{contents: map[string]string{
+		objectID("bucket", "one.txt"): content,
+		objectID("bucket", "two.txt"): content,
+	}}
+	for _, key := range []string{"one.txt", "two.txt"} {
+		info := objectInfo(key, int64(len(content)))
+		record := record("bucket", key, hash, info.Size)
+		record.ETag = info.ETag
+		record.LastModified = info.LastModified
+		if err := store.RegisterObject(ctx, record); err != nil {
+			t.Fatalf("RegisterObject %q: %v", key, err)
+		}
+	}
+	changed := objectInfo("one.txt", int64(len(content)))
+	changed.ETag = "changed-etag"
+	client.statHooks = map[string]func(*mockS3Client, int){
+		objectID("bucket", "one.txt"): func(client *mockS3Client, call int) {
+			if call == 1 {
+				if client.stats == nil {
+					client.stats = make(map[string]minio.ObjectInfo)
+				}
+				client.stats[objectID("bucket", "one.txt")] = changed
+			}
+		},
+	}
+
+	atomics := &atomicReportPart{}
+	if err := newTestScanner(t, client, store, cfg).pointerDeduplication(ctx, atomics, 1, "scan-2"); err != nil {
+		t.Fatalf("pointerDeduplication error: %v", err)
+	}
+	if atomics.processErrors.Load() != 0 {
+		t.Fatalf("processErrors = %d, expected 0", atomics.processErrors.Load())
+	}
+	if got := client.getCallCount("bucket", "one.txt"); got != 0 {
+		t.Fatalf("changed candidate GetObject calls = %d, expected 0", got)
+	}
+	if got := objectContentType(t, client, "bucket", "one.txt"); got == pointer.ContentPointerType {
+		t.Fatal("metadata-changed candidate was replaced using a stale cached hash")
+	}
+	if got := objectContentType(t, client, "bucket", "two.txt"); got != pointer.ContentPointerType {
+		t.Fatalf("stable duplicate ContentType = %q, expected pointer", got)
+	}
+}
+
+func TestPointerDeduplicationRetriesMaterializationWithAnotherStableCandidate(t *testing.T) {
+	const content = "duplicate content with changing representative"
+	ctx := context.Background()
+	store := openTestStore(t)
+	cfg := pointerTestConfig()
+	cfg.Dedup.DeleteOriginals = true
+	hash := hashContent(t, content)
+	client := &mockS3Client{contents: map[string]string{
+		objectID("bucket", "one.txt"): content,
+		objectID("bucket", "two.txt"): content,
+	}}
+	for _, key := range []string{"one.txt", "two.txt"} {
+		info := objectInfo(key, int64(len(content)))
+		record := record("bucket", key, hash, info.Size)
+		record.ETag = info.ETag
+		record.LastModified = info.LastModified
+		if err := store.RegisterObject(ctx, record); err != nil {
+			t.Fatalf("RegisterObject %q: %v", key, err)
+		}
+	}
+	changed := objectInfo("one.txt", int64(len(content)))
+	changed.ETag = "changed-during-read"
+	client.getHooks = map[string]func(*mockS3Client, int){
+		objectID("bucket", "one.txt"): func(client *mockS3Client, call int) {
+			if call == 1 {
+				if client.stats == nil {
+					client.stats = make(map[string]minio.ObjectInfo)
+				}
+				client.stats[objectID("bucket", "one.txt")] = changed
+			}
+		},
+	}
+
+	atomics := &atomicReportPart{}
+	if err := newTestScanner(t, client, store, cfg).pointerDeduplication(ctx, atomics, 1, "scan-2"); err != nil {
+		t.Fatalf("pointerDeduplication error: %v", err)
+	}
+	if atomics.processErrors.Load() != 0 {
+		t.Fatalf("processErrors = %d, expected 0", atomics.processErrors.Load())
+	}
+	if got := client.totalGetCalls(); got != 2 {
+		t.Fatalf("GetObject calls = %d, expected changed representative and one retry", got)
+	}
+	if got := objectContentType(t, client, "bucket", "one.txt"); got == pointer.ContentPointerType {
+		t.Fatal("representative changed during read but was replaced")
+	}
+	if got := objectContentType(t, client, "bucket", "two.txt"); got != pointer.ContentPointerType {
+		t.Fatalf("stable fallback candidate ContentType = %q, expected pointer", got)
+	}
+	blobKey := cfg.Dedup.BlobPrefix + hash
+	if got := client.content(objectID(cfg.Dedup.BlobBucket, blobKey)); got != content {
+		t.Fatalf("materialized blob content = %q, expected %q", got, content)
 	}
 }
 
