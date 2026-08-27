@@ -16,6 +16,7 @@ import (
 
 const (
 	discoveryBatchSize      = 1000
+	discoveryLookupPageSize = 1000
 	dedupBatchSize          = 100
 	dedupBatchFlushInterval = 100 * time.Millisecond
 	candidatePageSize       = 1000
@@ -148,6 +149,23 @@ func (s *Scanner) pointerDiscovery(
 
 	var listErr error
 	for _, bucket := range s.config.S3.Buckets {
+		page := make([]minio.ObjectInfo, 0, discoveryLookupPageSize)
+		flushPage := func() error {
+			if len(page) == 0 {
+				return nil
+			}
+			err := s.processDiscoveryPage(
+				discoveryCtx,
+				bucket.Name,
+				page,
+				jobs,
+				mutations,
+				scanID,
+			)
+			page = page[:0]
+			return err
+		}
+
 		listErr = s.s3Client.ListObjects(discoveryCtx, bucket.Name, bucket.Prefix, true, func(info minio.ObjectInfo) error {
 			if strings.HasPrefix(info.Key, s.config.Dedup.BlobPrefix) {
 				return nil
@@ -167,39 +185,15 @@ func (s *Scanner) pointerDiscovery(
 				return nil
 			}
 
-			status, err := s.store.GetObjectStatus(
-				discoveryCtx,
-				bucket.Name,
-				info.Key,
-				info.ETag,
-				info.Size,
-				s.config.Dedup.HashAlgo,
-				info.LastModified,
-			)
-			if err != nil {
-				return fmt.Errorf("GetObjectStatus %q/%q: %w", bucket.Name, info.Key, err)
+			page = append(page, info)
+			if len(page) == cap(page) {
+				return flushPage()
 			}
-			if status.Unchanged && stateRank(status.State) >= stateRank(cache.ObjectStateReported) {
-				if !s.sendDiscoveryMutation(discoveryCtx, mutations, cache.DiscoveryMutation{
-					Kind: cache.DiscoveryMarkSeen,
-					ID: cache.ObjectID{
-						Bucket: bucket.Name,
-						Key:    info.Key,
-						ScanID: scanID,
-					},
-				}) {
-					return discoveryCtx.Err()
-				}
-				return nil
-			}
-
-			select {
-			case jobs <- objectJob{buket: bucket.Name, info: info, scanID: scanID}:
-				return nil
-			case <-discoveryCtx.Done():
-				return discoveryCtx.Err()
-			}
+			return nil
 		})
+		if listErr == nil {
+			listErr = flushPage()
+		}
 		if listErr != nil {
 			break
 		}
@@ -220,6 +214,67 @@ func (s *Scanner) pointerDiscovery(
 	for _, bucket := range s.config.S3.Buckets {
 		if _, err := s.store.FinalizeScope(ctx, bucket.Name, bucket.Prefix, scanID); err != nil {
 			return fmt.Errorf("FinalizeScope for %q/%q: %w", bucket.Name, bucket.Prefix, err)
+		}
+	}
+	return nil
+}
+
+func (s *Scanner) processDiscoveryPage(
+	ctx context.Context,
+	bucket string,
+	objects []minio.ObjectInfo,
+	jobs chan<- objectJob,
+	mutations chan<- cache.DiscoveryMutation,
+	scanID string,
+) error {
+	metadata := make([]cache.ObjectMetadata, len(objects))
+	for index, object := range objects {
+		metadata[index] = cache.ObjectMetadata{
+			Key:          object.Key,
+			ETag:         object.ETag,
+			Size:         object.Size,
+			LastModified: object.LastModified,
+		}
+	}
+	statuses, err := s.store.GetObjectStatuses(
+		ctx,
+		bucket,
+		metadata,
+		s.config.Dedup.HashAlgo,
+	)
+	if err != nil {
+		return fmt.Errorf("GetObjectStatuses %q: %w", bucket, err)
+	}
+	if len(statuses) != len(objects) {
+		return fmt.Errorf(
+			"GetObjectStatuses %q returned %d statuses for %d objects",
+			bucket,
+			len(statuses),
+			len(objects),
+		)
+	}
+
+	for index, object := range objects {
+		status := statuses[index]
+		if status.Unchanged &&
+			stateRank(status.State) >= stateRank(cache.ObjectStateReported) {
+			if !s.sendDiscoveryMutation(ctx, mutations, cache.DiscoveryMutation{
+				Kind: cache.DiscoveryMarkSeen,
+				ID: cache.ObjectID{
+					Bucket: bucket,
+					Key:    object.Key,
+					ScanID: scanID,
+				},
+			}) {
+				return ctx.Err()
+			}
+			continue
+		}
+
+		select {
+		case jobs <- objectJob{buket: bucket, info: object, scanID: scanID}:
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 	return nil

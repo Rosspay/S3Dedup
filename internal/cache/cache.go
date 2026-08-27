@@ -17,6 +17,12 @@ type Store interface {
 		hashAlgo string,
 		lastModified time.Time,
 	) (status ObjectStatus, err error)
+	GetObjectStatuses(
+		ctx context.Context,
+		bucket string,
+		objects []ObjectMetadata,
+		hashAlgo string,
+	) ([]ObjectStatus, error)
 	ApplyDiscoveryBatch(ctx context.Context, mutations []DiscoveryMutation) error
 	ApplyDedupBatch(ctx context.Context, objects []ObjectRecord) error
 	ListDedupCandidates(
@@ -95,6 +101,13 @@ type ObjectStatus struct {
 	Unchanged bool
 	State     ObjectState
 	RefCount  int64
+}
+
+type ObjectMetadata struct {
+	Key          string
+	ETag         string
+	Size         int64
+	LastModified time.Time
 }
 
 type BlobRecord struct {

@@ -94,6 +94,38 @@ func TestOpenSQLiteErrors(t *testing.T) {
 	}
 }
 
+func TestGetObjectStatusesSupportsInMemoryDatabase(t *testing.T) {
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite error: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("Close error: %v", err)
+		}
+	}()
+	object := record("bucket", "one.txt", "hash", 100)
+	register(t, store, object)
+
+	statuses, err := store.GetObjectStatuses(
+		context.Background(),
+		object.Bucket,
+		[]ObjectMetadata{{
+			Key:          object.Key,
+			ETag:         object.ETag,
+			Size:         object.Size,
+			LastModified: object.LastModified,
+		}},
+		object.HashAlgo,
+	)
+	if err != nil {
+		t.Fatalf("GetObjectStatuses error: %v", err)
+	}
+	if len(statuses) != 1 || !statuses[0].Unchanged {
+		t.Fatalf("statuses = %+v, expected unchanged object", statuses)
+	}
+}
+
 func TestFinalizeScopeObjectIsNotDiscoveredSameHash(t *testing.T) {
 	store := openTestStore(t)
 	register(t, store, record("bucket", "one.txt", "hash", 100))
@@ -263,6 +295,142 @@ func TestGetObjectStatusDifferentHashAlgorithmIsChanged(t *testing.T) {
 	}
 	if status.Unchanged {
 		t.Errorf("status = %+v, expected changed object for a different hash algorithm", status)
+	}
+}
+
+func TestGetObjectStatusesReturnsMixedResultsInInputOrder(t *testing.T) {
+	store := openTestStore(t)
+	exact := record("bucket", `folder/'quoted".txt`, "shared-hash", 100)
+	exact.LastModified = exact.LastModified.Add(123 * time.Millisecond)
+	changedETag := record("bucket", "changed-etag.txt", "shared-hash", 100)
+	changedSize := record("bucket", "changed-size.txt", "shared-hash", 100)
+	changedTime := record("bucket", "changed-time.txt", "shared-hash", 100)
+	for _, object := range []ObjectRecord{exact, changedETag, changedSize, changedTime} {
+		register(t, store, object)
+	}
+
+	statuses, err := store.GetObjectStatuses(
+		context.Background(),
+		"bucket",
+		[]ObjectMetadata{
+			{
+				Key:          exact.Key,
+				ETag:         exact.ETag,
+				Size:         exact.Size,
+				LastModified: exact.LastModified.Add(700 * time.Millisecond),
+			},
+			{
+				Key:          changedETag.Key,
+				ETag:         "different-etag",
+				Size:         changedETag.Size,
+				LastModified: changedETag.LastModified,
+			},
+			{
+				Key:          "missing.txt",
+				ETag:         "missing-etag",
+				Size:         100,
+				LastModified: exact.LastModified,
+			},
+			{
+				Key:          changedSize.Key,
+				ETag:         changedSize.ETag,
+				Size:         changedSize.Size + 1,
+				LastModified: changedSize.LastModified,
+			},
+			{
+				Key:          changedTime.Key,
+				ETag:         changedTime.ETag,
+				Size:         changedTime.Size,
+				LastModified: changedTime.LastModified.Add(time.Second),
+			},
+		},
+		"sha256",
+	)
+	if err != nil {
+		t.Fatalf("GetObjectStatuses error: %v", err)
+	}
+	if len(statuses) != 5 {
+		t.Fatalf("statuses length = %d, expected 5", len(statuses))
+	}
+	if got := statuses[0]; !got.Unchanged || got.State != ObjectStateReported || got.RefCount != 4 {
+		t.Errorf("exact status = %+v, expected unchanged reported object with ref_count 4", got)
+	}
+	for index, status := range statuses[1:] {
+		if status.Unchanged {
+			t.Errorf("changed status %d = %+v, expected changed object", index+1, status)
+		}
+	}
+
+	differentAlgo, err := store.GetObjectStatuses(
+		context.Background(),
+		"bucket",
+		[]ObjectMetadata{{
+			Key:          exact.Key,
+			ETag:         exact.ETag,
+			Size:         exact.Size,
+			LastModified: exact.LastModified,
+		}},
+		"sha512",
+	)
+	if err != nil {
+		t.Fatalf("GetObjectStatuses different hash algorithm: %v", err)
+	}
+	if len(differentAlgo) != 1 || differentAlgo[0].Unchanged {
+		t.Fatalf("different hash algorithm statuses = %+v, expected changed object", differentAlgo)
+	}
+}
+
+func TestGetObjectStatusesUsesReaderDuringWriteTransaction(t *testing.T) {
+	store := openTestStore(t)
+	object := record("bucket", "one.txt", "hash", 100)
+	register(t, store, object)
+
+	tx, err := store.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("BeginTx error: %v", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(
+		context.Background(),
+		`UPDATE objects SET etag = ? WHERE bucket = ? AND object_key = ?`,
+		"uncommitted-etag",
+		object.Bucket,
+		object.Key,
+	); err != nil {
+		t.Fatalf("update object in transaction: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	statuses, err := store.GetObjectStatuses(
+		ctx,
+		object.Bucket,
+		[]ObjectMetadata{{
+			Key:          object.Key,
+			ETag:         object.ETag,
+			Size:         object.Size,
+			LastModified: object.LastModified,
+		}},
+		object.HashAlgo,
+	)
+	if err != nil {
+		t.Fatalf("GetObjectStatuses while writer transaction is open: %v", err)
+	}
+	if len(statuses) != 1 || !statuses[0].Unchanged {
+		t.Fatalf("statuses = %+v, expected committed object snapshot", statuses)
+	}
+}
+
+func TestGetObjectStatusesRejectsDuplicateKeys(t *testing.T) {
+	store := openTestStore(t)
+	_, err := store.GetObjectStatuses(
+		context.Background(),
+		"bucket",
+		[]ObjectMetadata{{Key: "same.txt"}, {Key: "same.txt"}},
+		"sha256",
+	)
+	if err == nil {
+		t.Fatal("GetObjectStatuses expected duplicate key error")
 	}
 }
 

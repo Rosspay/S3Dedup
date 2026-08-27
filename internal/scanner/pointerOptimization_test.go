@@ -3,6 +3,7 @@ package scanner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,14 +18,49 @@ import (
 type countingDiscoveryStore struct {
 	cache.Store
 	batchCalls        atomic.Int64
+	bulkLookupCalls   atomic.Int64
+	bulkLookupObjects atomic.Int64
 	dedupBatchCalls   atomic.Int64
 	dedupBatchRecords atomic.Int64
 	registerCalls     atomic.Int64
+	singleLookupCalls atomic.Int64
 }
 
 func (s *countingDiscoveryStore) ApplyDiscoveryBatch(ctx context.Context, mutations []cache.DiscoveryMutation) error {
 	s.batchCalls.Add(1)
 	return s.Store.ApplyDiscoveryBatch(ctx, mutations)
+}
+
+func (s *countingDiscoveryStore) GetObjectStatus(
+	ctx context.Context,
+	bucket string,
+	key string,
+	etag string,
+	size int64,
+	hashAlgo string,
+	lastModified time.Time,
+) (cache.ObjectStatus, error) {
+	s.singleLookupCalls.Add(1)
+	return s.Store.GetObjectStatus(
+		ctx,
+		bucket,
+		key,
+		etag,
+		size,
+		hashAlgo,
+		lastModified,
+	)
+}
+
+func (s *countingDiscoveryStore) GetObjectStatuses(
+	ctx context.Context,
+	bucket string,
+	objects []cache.ObjectMetadata,
+	hashAlgo string,
+) ([]cache.ObjectStatus, error) {
+	s.bulkLookupCalls.Add(1)
+	s.bulkLookupObjects.Add(int64(len(objects)))
+	return s.Store.GetObjectStatuses(ctx, bucket, objects, hashAlgo)
 }
 
 func (s *countingDiscoveryStore) ApplyDedupBatch(ctx context.Context, objects []cache.ObjectRecord) error {
@@ -45,6 +81,20 @@ type failingDiscoveryStore struct {
 
 func (s *failingDiscoveryStore) ApplyDiscoveryBatch(context.Context, []cache.DiscoveryMutation) error {
 	return s.err
+}
+
+type failingBulkLookupStore struct {
+	cache.Store
+	err error
+}
+
+func (s *failingBulkLookupStore) GetObjectStatuses(
+	context.Context,
+	string,
+	[]cache.ObjectMetadata,
+	string,
+) ([]cache.ObjectStatus, error) {
+	return nil, s.err
 }
 
 func TestPointerModeListsS3Once(t *testing.T) {
@@ -74,6 +124,193 @@ func TestPointerModeListsS3Once(t *testing.T) {
 	client.mu.RUnlock()
 	if listCalls != len(cfg.S3.Buckets) {
 		t.Fatalf("ListObjects calls = %d, expected %d", listCalls, len(cfg.S3.Buckets))
+	}
+}
+
+func TestPointerDiscoveryUsesBulkLookupPages(t *testing.T) {
+	const objectCount = discoveryLookupPageSize + 1
+	client := &mockS3Client{
+		objects:  make([]minio.ObjectInfo, 0, objectCount),
+		contents: make(map[string]string, objectCount),
+	}
+	for index := 0; index < objectCount; index++ {
+		key := fmt.Sprintf("object-%04d.txt", index)
+		content := fmt.Sprintf("unique-content-%04d", index)
+		client.objects = append(client.objects, objectInfo(key, int64(len(content))))
+		client.contents[objectID("bucket", key)] = content
+	}
+	store := openTestStore(t)
+	countingStore := &countingDiscoveryStore{Store: store}
+	cfg := pointerTestConfig()
+	cfg.Schedule.Workers = 64
+
+	result, err := newTestScanner(t, client, countingStore, cfg).ScanOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ScanOnce error: %v", err)
+	}
+	if result.Errors != 0 || result.UniqueBlobs != objectCount {
+		t.Fatalf("result = %+v, expected %d unique objects without errors", result, objectCount)
+	}
+	if got := countingStore.bulkLookupCalls.Load(); got != 2 {
+		t.Fatalf("GetObjectStatuses calls = %d, expected 2", got)
+	}
+	if got := countingStore.bulkLookupObjects.Load(); got != objectCount {
+		t.Fatalf("GetObjectStatuses objects = %d, expected %d", got, objectCount)
+	}
+	if got := countingStore.singleLookupCalls.Load(); got != 0 {
+		t.Fatalf("GetObjectStatus calls = %d, expected 0", got)
+	}
+	if got := client.totalGetCalls(); got != objectCount {
+		t.Fatalf("GetObject calls = %d, expected %d", got, objectCount)
+	}
+	if got := client.totalStatCalls(); got != objectCount {
+		t.Fatalf("StatObject calls = %d, expected %d", got, objectCount)
+	}
+}
+
+func TestPointerDiscoveryBulkLookupSkipsUnchangedObjects(t *testing.T) {
+	const cachedContent = "cached-content"
+	const newContent = "new-content"
+	cachedInfo := objectInfo("cached.txt", int64(len(cachedContent)))
+	newInfo := objectInfo("new.txt", int64(len(newContent)))
+	client := &mockS3Client{
+		objects: []minio.ObjectInfo{cachedInfo, newInfo},
+		contents: map[string]string{
+			objectID("bucket", cachedInfo.Key): cachedContent,
+			objectID("bucket", newInfo.Key):    newContent,
+		},
+	}
+	store := openTestStore(t)
+	cached := record(
+		"bucket",
+		cachedInfo.Key,
+		hashContent(t, cachedContent),
+		cachedInfo.Size,
+	)
+	cached.ETag = cachedInfo.ETag
+	cached.LastModified = cachedInfo.LastModified
+	if err := store.RegisterObject(context.Background(), cached); err != nil {
+		t.Fatalf("RegisterObject error: %v", err)
+	}
+	countingStore := &countingDiscoveryStore{Store: store}
+
+	result, err := newTestScanner(
+		t,
+		client,
+		countingStore,
+		pointerTestConfig(),
+	).ScanOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ScanOnce error: %v", err)
+	}
+	if result.Errors != 0 || result.UniqueBlobs != 2 {
+		t.Fatalf("result = %+v, expected two unique objects without errors", result)
+	}
+	if got := countingStore.bulkLookupCalls.Load(); got != 1 {
+		t.Fatalf("GetObjectStatuses calls = %d, expected 1", got)
+	}
+	if got := countingStore.singleLookupCalls.Load(); got != 0 {
+		t.Fatalf("GetObjectStatus calls = %d, expected 0", got)
+	}
+	if got := client.totalGetCalls(); got != 1 {
+		t.Fatalf("GetObject calls = %d, expected only the new object", got)
+	}
+	if got := client.totalStatCalls(); got != 1 {
+		t.Fatalf("StatObject calls = %d, expected only the new object", got)
+	}
+}
+
+func TestPointerDiscoveryBulkLookupErrorDoesNotFinalizeScope(t *testing.T) {
+	lookupErr := errors.New("bulk lookup failed")
+	client := &mockS3Client{
+		objects: []minio.ObjectInfo{objectInfo("new.txt", 10)},
+		contents: map[string]string{
+			objectID("bucket", "new.txt"): "new-content",
+		},
+	}
+	store := openTestStore(t)
+	stale := record("bucket", "stale.txt", "stale-hash", 10)
+	if err := store.RegisterObject(context.Background(), stale); err != nil {
+		t.Fatalf("RegisterObject error: %v", err)
+	}
+	failingStore := &failingBulkLookupStore{Store: store, err: lookupErr}
+
+	_, err := newTestScanner(
+		t,
+		client,
+		failingStore,
+		pointerTestConfig(),
+	).ScanOnce(context.Background())
+	if !errors.Is(err, lookupErr) {
+		t.Fatalf("ScanOnce error = %v, expected %v", err, lookupErr)
+	}
+	if got := client.totalGetCalls(); got != 0 {
+		t.Fatalf("GetObject calls = %d, expected 0", got)
+	}
+	status, statusErr := store.GetObjectStatus(
+		context.Background(),
+		stale.Bucket,
+		stale.Key,
+		stale.ETag,
+		stale.Size,
+		stale.HashAlgo,
+		stale.LastModified,
+	)
+	if statusErr != nil {
+		t.Fatalf("GetObjectStatus error: %v", statusErr)
+	}
+	if !status.Unchanged {
+		t.Fatalf("stale status = %+v, expected scope not to be finalized", status)
+	}
+}
+
+func TestPointerDiscoverySmallObjectsBypassBulkLookupAndAreUnregistered(t *testing.T) {
+	const content = "small"
+	info := objectInfo("small.txt", int64(len(content)))
+	client := &mockS3Client{
+		objects: []minio.ObjectInfo{info},
+		contents: map[string]string{
+			objectID("bucket", info.Key): content,
+		},
+	}
+	store := openTestStore(t)
+	cached := record("bucket", info.Key, hashContent(t, content), info.Size)
+	cached.ETag = info.ETag
+	cached.LastModified = info.LastModified
+	if err := store.RegisterObject(context.Background(), cached); err != nil {
+		t.Fatalf("RegisterObject error: %v", err)
+	}
+	countingStore := &countingDiscoveryStore{Store: store}
+	cfg := pointerTestConfig()
+	cfg.Dedup.MinSizeBytes = 100
+
+	result, err := newTestScanner(t, client, countingStore, cfg).ScanOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ScanOnce error: %v", err)
+	}
+	if result.Errors != 0 || result.UniqueBlobs != 0 {
+		t.Fatalf("result = %+v, expected no cached objects", result)
+	}
+	if got := countingStore.bulkLookupCalls.Load(); got != 0 {
+		t.Fatalf("GetObjectStatuses calls = %d, expected 0", got)
+	}
+	if got := client.totalGetCalls(); got != 0 {
+		t.Fatalf("GetObject calls = %d, expected 0", got)
+	}
+	status, statusErr := store.GetObjectStatus(
+		context.Background(),
+		cached.Bucket,
+		cached.Key,
+		cached.ETag,
+		cached.Size,
+		cached.HashAlgo,
+		cached.LastModified,
+	)
+	if statusErr != nil {
+		t.Fatalf("GetObjectStatus error: %v", statusErr)
+	}
+	if status.Unchanged {
+		t.Fatalf("status = %+v, expected small object to be unregistered", status)
 	}
 }
 

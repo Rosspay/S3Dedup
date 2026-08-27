@@ -292,6 +292,16 @@ func (m *mockS3Client) totalGetCalls() int {
 	return total
 }
 
+func (m *mockS3Client) totalStatCalls() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var total int
+	for _, calls := range m.statCalls {
+		total += calls
+	}
+	return total
+}
+
 func (m *mockS3Client) totalPutCalls() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

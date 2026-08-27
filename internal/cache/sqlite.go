@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -16,7 +17,8 @@ import (
 const sqliteTimeFormat = "2006-01-02T15:04:05.999999999Z07:00"
 
 type SQLiteStore struct {
-	db *sql.DB
+	db     *sql.DB
+	readDB *sql.DB
 }
 
 func formatObjectTime(value time.Time) string {
@@ -52,6 +54,27 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("Error initializing db: %w", err)
 	}
+	if path == ":memory:" {
+		store.readDB = db
+		return store, nil
+	}
+
+	readDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("Open SQLite cache reader %q: %w", path, err)
+	}
+	readDB.SetMaxOpenConns(1)
+	readDB.SetMaxIdleConns(1)
+	if _, err := readDB.ExecContext(
+		context.Background(),
+		"PRAGMA busy_timeout = 5000; PRAGMA query_only = ON;",
+	); err != nil {
+		readDB.Close()
+		db.Close()
+		return nil, fmt.Errorf("Initialize SQLite cache reader: %w", err)
+	}
+	store.readDB = readDB
 	return store, nil
 }
 
@@ -261,6 +284,115 @@ func (s *SQLiteStore) GetObjectStatus(
 	}
 	status.Unchanged = true
 	return status, nil
+}
+
+func (s *SQLiteStore) GetObjectStatuses(
+	ctx context.Context,
+	bucket string,
+	objects []ObjectMetadata,
+	hashAlgo string,
+) ([]ObjectStatus, error) {
+	statuses := make([]ObjectStatus, len(objects))
+	if len(objects) == 0 {
+		return statuses, nil
+	}
+
+	keys := make([]string, len(objects))
+	indexes := make(map[string]int, len(objects))
+	for index, object := range objects {
+		if _, exists := indexes[object.Key]; exists {
+			return nil, fmt.Errorf(
+				"GetObjectStatuses %q: duplicate object key %q",
+				bucket,
+				object.Key,
+			)
+		}
+		keys[index] = object.Key
+		indexes[object.Key] = index
+	}
+
+	encodedKeys, err := json.Marshal(keys)
+	if err != nil {
+		return nil, fmt.Errorf("GetObjectStatuses %q: encode keys: %w", bucket, err)
+	}
+
+	const query = `
+	SELECT
+		o.object_key,
+		o.etag,
+		o.size,
+		o.last_modified,
+		o.object_state,
+		b.ref_count
+	FROM json_each(?) AS requested
+	CROSS JOIN objects AS o
+	ON o.bucket = ?
+	AND o.object_key = requested.value
+	AND o.hash_algo = ?
+	JOIN blobs AS b
+	ON b.bucket = o.blob_bucket
+	AND b.hash = o.blob_hash
+	`
+	rows, err := s.readDB.QueryContext(
+		ctx,
+		query,
+		string(encodedKeys),
+		bucket,
+		hashAlgo,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("GetObjectStatuses %q: query: %w", bucket, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var key string
+		var etag string
+		var size int64
+		var lastModified string
+		var state ObjectState
+		var refCount int64
+		if err := rows.Scan(
+			&key,
+			&etag,
+			&size,
+			&lastModified,
+			&state,
+			&refCount,
+		); err != nil {
+			return nil, fmt.Errorf("GetObjectStatuses %q: scan: %w", bucket, err)
+		}
+		if state == "" {
+			return nil, fmt.Errorf(
+				"GetObjectStatuses %q/%q: undefined object_state in cache",
+				bucket,
+				key,
+			)
+		}
+
+		index, exists := indexes[key]
+		if !exists {
+			return nil, fmt.Errorf(
+				"GetObjectStatuses %q: unexpected object key %q",
+				bucket,
+				key,
+			)
+		}
+		object := objects[index]
+		if etag == object.ETag &&
+			size == object.Size &&
+			lastModified == formatObjectTime(object.LastModified) {
+			statuses[index] = ObjectStatus{
+				Unchanged: true,
+				State:     state,
+				RefCount:  refCount,
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("GetObjectStatuses %q: rows: %w", bucket, err)
+	}
+	return statuses, nil
 }
 
 func validateObject(object ObjectRecord) error {
@@ -557,8 +689,27 @@ func (s *SQLiteStore) DeleteUnreferencedBlob(
 
 // Closing store
 func (s *SQLiteStore) Close() error {
-	if err := s.db.Close(); err != nil {
-		return fmt.Errorf("Error closing SQLite: %w", err)
+	if s.readDB == s.db {
+		if err := s.db.Close(); err != nil {
+			return fmt.Errorf("Error closing SQLite: %w", err)
+		}
+		return nil
 	}
-	return nil
+
+	readErr := s.readDB.Close()
+	writeErr := s.db.Close()
+	switch {
+	case readErr != nil && writeErr != nil:
+		return fmt.Errorf(
+			"Error closing SQLite reader: %v; writer: %w",
+			readErr,
+			writeErr,
+		)
+	case readErr != nil:
+		return fmt.Errorf("Error closing SQLite reader: %w", readErr)
+	case writeErr != nil:
+		return fmt.Errorf("Error closing SQLite writer: %w", writeErr)
+	default:
+		return nil
+	}
 }

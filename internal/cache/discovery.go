@@ -3,21 +3,109 @@ package cache
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 )
 
+const createDiscoveryRegisterBatchTable = `
+	CREATE TEMP TABLE IF NOT EXISTS discovery_register_batch (
+		bucket TEXT NOT NULL,
+		object_key TEXT NOT NULL,
+		etag TEXT NOT NULL,
+		size INTEGER NOT NULL,
+		last_modified TEXT NOT NULL,
+		blob_bucket TEXT NOT NULL,
+		blob_key TEXT NOT NULL,
+		blob_hash TEXT NOT NULL,
+		blob_size INTEGER NOT NULL,
+		hash_algo TEXT NOT NULL,
+		last_seen_scan TEXT NOT NULL,
+		object_state TEXT NOT NULL,
+		PRIMARY KEY (bucket, object_key)
+	) WITHOUT ROWID
+`
+
+const createDiscoveryObjectIDBatchTable = `
+	CREATE TEMP TABLE IF NOT EXISTS discovery_object_id_batch (
+		bucket TEXT NOT NULL,
+		object_key TEXT NOT NULL,
+		scan_id TEXT NOT NULL,
+		PRIMARY KEY (bucket, object_key)
+	) WITHOUT ROWID
+`
+
+type discoveryRegisterRow struct {
+	Bucket       string `json:"bucket"`
+	ObjectKey    string `json:"object_key"`
+	ETag         string `json:"etag"`
+	Size         int64  `json:"size"`
+	LastModified string `json:"last_modified"`
+	BlobBucket   string `json:"blob_bucket"`
+	BlobKey      string `json:"blob_key"`
+	BlobHash     string `json:"blob_hash"`
+	BlobSize     int64  `json:"blob_size"`
+	HashAlgo     string `json:"hash_algo"`
+	LastSeenScan string `json:"last_seen_scan"`
+	ObjectState  string `json:"object_state"`
+}
+
+type discoveryObjectIDRow struct {
+	Bucket    string `json:"bucket"`
+	ObjectKey string `json:"object_key"`
+	ScanID    string `json:"scan_id"`
+}
+
+type discoveryObjectKey struct {
+	bucket string
+	key    string
+}
+
 func (s *SQLiteStore) ApplyDiscoveryBatch(ctx context.Context, mutations []DiscoveryMutation) error {
 	if len(mutations) == 0 {
 		return nil
 	}
+
+	registers := make([]ObjectRecord, 0, len(mutations))
+	marks := make([]ObjectID, 0, len(mutations))
+	unregisters := make([]ObjectID, 0, len(mutations))
+	seenObjects := make(map[discoveryObjectKey]struct{}, len(mutations))
+	hasDuplicateObject := false
 	for _, mutation := range mutations {
-		if mutation.Kind == DiscoveryRegister {
+		var bucket string
+		var key string
+		switch mutation.Kind {
+		case DiscoveryRegister:
 			if err := validateObject(mutation.Object); err != nil {
 				return err
 			}
+			bucket = mutation.Object.Bucket
+			key = mutation.Object.Key
+			registers = append(registers, mutation.Object)
+		case DiscoveryMarkSeen:
+			if mutation.ID.Bucket == "" || mutation.ID.Key == "" || mutation.ID.ScanID == "" {
+				return fmt.Errorf("mark object seen: bucket, key and scan ID are required")
+			}
+			bucket = mutation.ID.Bucket
+			key = mutation.ID.Key
+			marks = append(marks, mutation.ID)
+		case DiscoveryUnregister:
+			if mutation.ID.Bucket == "" || mutation.ID.Key == "" {
+				return fmt.Errorf("unregister object: bucket and key are required")
+			}
+			bucket = mutation.ID.Bucket
+			key = mutation.ID.Key
+			unregisters = append(unregisters, mutation.ID)
+		default:
+			return fmt.Errorf("apply discovery batch: unsupported mutation kind %d", mutation.Kind)
 		}
+
+		objectID := discoveryObjectKey{bucket: bucket, key: key}
+		if _, exists := seenObjects[objectID]; exists {
+			hasDuplicateObject = true
+		}
+		seenObjects[objectID] = struct{}{}
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -26,6 +114,33 @@ func (s *SQLiteStore) ApplyDiscoveryBatch(ctx context.Context, mutations []Disco
 	}
 	defer tx.Rollback()
 
+	if hasDuplicateObject {
+		if err := applyDiscoveryMutationsSequential(ctx, tx, mutations); err != nil {
+			return err
+		}
+	} else {
+		if err := applyDiscoveryRegisterBatch(ctx, tx, registers); err != nil {
+			return err
+		}
+		if err := applyDiscoveryMarkSeenBatch(ctx, tx, marks); err != nil {
+			return err
+		}
+		if err := applyDiscoveryUnregisterBatch(ctx, tx, unregisters); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("apply discovery batch: commit: %w", err)
+	}
+	return nil
+}
+
+func applyDiscoveryMutationsSequential(
+	ctx context.Context,
+	tx *sql.Tx,
+	mutations []DiscoveryMutation,
+) error {
 	for _, mutation := range mutations {
 		switch mutation.Kind {
 		case DiscoveryRegister:
@@ -40,15 +155,408 @@ func (s *SQLiteStore) ApplyDiscoveryBatch(ctx context.Context, mutations []Disco
 			if err := applyUnregisterMutation(ctx, tx, mutation.ID); err != nil {
 				return err
 			}
-		default:
-			return fmt.Errorf("apply discovery batch: unsupported mutation kind %d", mutation.Kind)
 		}
 	}
+	return nil
+}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("apply discovery batch: commit: %w", err)
+func applyDiscoveryRegisterBatch(
+	ctx context.Context,
+	tx *sql.Tx,
+	objects []ObjectRecord,
+) error {
+	if len(objects) == 0 {
+		return nil
+	}
+
+	rows := make([]discoveryRegisterRow, len(objects))
+	for index, object := range objects {
+		rows[index] = discoveryRegisterRow{
+			Bucket:       object.Bucket,
+			ObjectKey:    object.Key,
+			ETag:         object.ETag,
+			Size:         object.Size,
+			LastModified: formatObjectTime(object.LastModified),
+			BlobBucket:   object.BlobBucket,
+			BlobKey:      object.BlobKey,
+			BlobHash:     object.Hash,
+			BlobSize:     object.BlobSize,
+			HashAlgo:     object.HashAlgo,
+			LastSeenScan: object.LastSeenScan,
+			ObjectState:  string(object.State),
+		}
+	}
+	payload, err := json.Marshal(rows)
+	if err != nil {
+		return fmt.Errorf("apply discovery register batch: encode rows: %w", err)
+	}
+	if err := loadDiscoveryRegisterBatch(ctx, tx, payload); err != nil {
+		return err
+	}
+
+	var referenceChanges int64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM discovery_register_batch AS r
+		LEFT JOIN objects AS o
+		ON o.bucket = r.bucket
+		AND o.object_key = r.object_key
+		WHERE o.object_key IS NULL
+		OR o.blob_bucket <> r.blob_bucket
+		OR o.blob_hash <> r.blob_hash
+	`).Scan(&referenceChanges); err != nil {
+		return fmt.Errorf("apply discovery register batch: count reference changes: %w", err)
+	}
+	if referenceChanges == 0 {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE objects
+			SET
+				etag = i.etag,
+				size = i.size,
+				last_modified = i.last_modified,
+				blob_bucket = i.blob_bucket,
+				blob_hash = i.blob_hash,
+				hash_algo = i.hash_algo,
+				last_seen_scan = i.last_seen_scan,
+				object_state = i.object_state
+			FROM discovery_register_batch AS i
+			WHERE i.bucket = objects.bucket
+			AND i.object_key = objects.object_key
+		`); err != nil {
+			return fmt.Errorf("apply discovery register batch: update object metadata: %w", err)
+		}
+		return nil
+	}
+
+	var blobBucket string
+	var blobHash string
+	err = tx.QueryRowContext(ctx, `
+		SELECT
+			r.blob_bucket,
+			r.blob_hash
+		FROM discovery_register_batch AS r
+		LEFT JOIN objects AS o
+		ON o.bucket = r.bucket
+		AND o.object_key = r.object_key
+		WHERE (
+			o.object_key IS NULL
+			OR o.blob_bucket <> r.blob_bucket
+			OR o.blob_hash <> r.blob_hash
+		)
+		GROUP BY r.blob_bucket, r.blob_hash
+		HAVING MIN(r.blob_key) <> MAX(r.blob_key)
+		OR MIN(r.blob_size) <> MAX(r.blob_size)
+		LIMIT 1
+	`).Scan(&blobBucket, &blobHash)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+	case err != nil:
+		return fmt.Errorf("apply discovery register batch: validate incoming blobs: %w", err)
+	default:
+		return fmt.Errorf(
+			"blob %q/%q metadata conflicts within discovery batch",
+			blobBucket,
+			blobHash,
+		)
+	}
+
+	var storedBlobKey string
+	var storedBlobSize int64
+	var incomingBlobKey string
+	var incomingBlobSize int64
+	err = tx.QueryRowContext(ctx, `
+		SELECT
+			r.blob_bucket,
+			r.blob_hash,
+			b.blob_key,
+			b.size,
+			r.blob_key,
+			r.blob_size
+		FROM discovery_register_batch AS r
+		LEFT JOIN objects AS o
+		ON o.bucket = r.bucket
+		AND o.object_key = r.object_key
+		JOIN blobs AS b
+		ON b.bucket = r.blob_bucket
+		AND b.hash = r.blob_hash
+		WHERE (
+			o.object_key IS NULL
+			OR o.blob_bucket <> r.blob_bucket
+			OR o.blob_hash <> r.blob_hash
+		)
+		AND (b.blob_key <> r.blob_key OR b.size <> r.blob_size)
+		LIMIT 1
+	`).Scan(
+		&blobBucket,
+		&blobHash,
+		&storedBlobKey,
+		&storedBlobSize,
+		&incomingBlobKey,
+		&incomingBlobSize,
+	)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+	case err != nil:
+		return fmt.Errorf("apply discovery register batch: validate blobs: %w", err)
+	case storedBlobKey != incomingBlobKey:
+		return fmt.Errorf(
+			"blob %q/%q key mismatch: stored %q, got %q",
+			blobBucket,
+			blobHash,
+			storedBlobKey,
+			incomingBlobKey,
+		)
+	default:
+		return fmt.Errorf(
+			"blob %q/%q size mismatch: stored %d, got %d",
+			blobBucket,
+			blobHash,
+			storedBlobSize,
+			incomingBlobSize,
+		)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		WITH increments AS (
+			SELECT
+				r.blob_bucket AS bucket,
+				r.blob_key AS blob_key,
+				r.blob_hash AS hash,
+				r.blob_size AS size,
+				COUNT(*) AS ref_count
+			FROM discovery_register_batch AS r
+			LEFT JOIN objects AS o
+			ON o.bucket = r.bucket
+			AND o.object_key = r.object_key
+			WHERE o.object_key IS NULL
+			OR o.blob_bucket <> r.blob_bucket
+			OR o.blob_hash <> r.blob_hash
+			GROUP BY r.blob_bucket, r.blob_key, r.blob_hash, r.blob_size
+		)
+		INSERT INTO blobs (bucket, blob_key, hash, size, ref_count)
+		SELECT bucket, blob_key, hash, size, ref_count
+		FROM increments
+		WHERE true
+		ON CONFLICT(bucket, hash) DO UPDATE SET
+			ref_count = blobs.ref_count + excluded.ref_count
+	`); err != nil {
+		return fmt.Errorf("apply discovery register batch: increment blobs: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		WITH decrements AS (
+			SELECT
+				o.blob_bucket AS bucket,
+				o.blob_hash AS hash,
+				COUNT(*) AS ref_count
+			FROM discovery_register_batch AS r
+			JOIN objects AS o
+			ON o.bucket = r.bucket
+			AND o.object_key = r.object_key
+			WHERE o.blob_bucket <> r.blob_bucket
+			OR o.blob_hash <> r.blob_hash
+			GROUP BY o.blob_bucket, o.blob_hash
+		)
+		UPDATE blobs
+		SET ref_count = blobs.ref_count - d.ref_count
+		FROM decrements AS d
+		WHERE d.bucket = blobs.bucket
+		AND d.hash = blobs.hash
+	`); err != nil {
+		return fmt.Errorf("apply discovery register batch: decrement blobs: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO objects (
+			bucket,
+			object_key,
+			etag,
+			size,
+			last_modified,
+			blob_bucket,
+			blob_hash,
+			hash_algo,
+			last_seen_scan,
+			object_state
+		)
+		SELECT
+			bucket,
+			object_key,
+			etag,
+			size,
+			last_modified,
+			blob_bucket,
+			blob_hash,
+			hash_algo,
+			last_seen_scan,
+			object_state
+		FROM discovery_register_batch
+		WHERE true
+		ON CONFLICT(bucket, object_key) DO UPDATE SET
+			etag = excluded.etag,
+			size = excluded.size,
+			last_modified = excluded.last_modified,
+			blob_bucket = excluded.blob_bucket,
+			blob_hash = excluded.blob_hash,
+			hash_algo = excluded.hash_algo,
+			last_seen_scan = excluded.last_seen_scan,
+			object_state = excluded.object_state
+	`); err != nil {
+		return fmt.Errorf("apply discovery register batch: upsert objects: %w", err)
 	}
 	return nil
+}
+
+func applyDiscoveryMarkSeenBatch(
+	ctx context.Context,
+	tx *sql.Tx,
+	objects []ObjectID,
+) error {
+	if len(objects) == 0 {
+		return nil
+	}
+	payload, err := marshalDiscoveryObjectIDs(objects)
+	if err != nil {
+		return fmt.Errorf("apply discovery mark-seen batch: %w", err)
+	}
+	if err := loadDiscoveryObjectIDBatch(ctx, tx, payload); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE objects
+		SET last_seen_scan = i.scan_id
+		FROM discovery_object_id_batch AS i
+		WHERE i.bucket = objects.bucket
+		AND i.object_key = objects.object_key
+	`); err != nil {
+		return fmt.Errorf("apply discovery mark-seen batch: update objects: %w", err)
+	}
+	return nil
+}
+
+func applyDiscoveryUnregisterBatch(
+	ctx context.Context,
+	tx *sql.Tx,
+	objects []ObjectID,
+) error {
+	if len(objects) == 0 {
+		return nil
+	}
+	payload, err := marshalDiscoveryObjectIDs(objects)
+	if err != nil {
+		return fmt.Errorf("apply discovery unregister batch: %w", err)
+	}
+	if err := loadDiscoveryObjectIDBatch(ctx, tx, payload); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		WITH decrements AS (
+			SELECT
+				o.blob_bucket AS bucket,
+				o.blob_hash AS hash,
+				COUNT(*) AS ref_count
+			FROM discovery_object_id_batch AS i
+			JOIN objects AS o
+			ON o.bucket = i.bucket
+			AND o.object_key = i.object_key
+			GROUP BY o.blob_bucket, o.blob_hash
+		)
+		UPDATE blobs
+		SET ref_count = blobs.ref_count - d.ref_count
+		FROM decrements AS d
+		WHERE d.bucket = blobs.bucket
+		AND d.hash = blobs.hash
+	`); err != nil {
+		return fmt.Errorf("apply discovery unregister batch: decrement blobs: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM objects
+		WHERE (bucket, object_key) IN (
+			SELECT bucket, object_key
+			FROM discovery_object_id_batch
+		)
+	`); err != nil {
+		return fmt.Errorf("apply discovery unregister batch: delete objects: %w", err)
+	}
+	return nil
+}
+
+func loadDiscoveryRegisterBatch(ctx context.Context, tx *sql.Tx, payload []byte) error {
+	if _, err := tx.ExecContext(ctx, createDiscoveryRegisterBatchTable); err != nil {
+		return fmt.Errorf("apply discovery register batch: create staging table: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM discovery_register_batch`); err != nil {
+		return fmt.Errorf("apply discovery register batch: clear staging table: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO discovery_register_batch (
+			bucket,
+			object_key,
+			etag,
+			size,
+			last_modified,
+			blob_bucket,
+			blob_key,
+			blob_hash,
+			blob_size,
+			hash_algo,
+			last_seen_scan,
+			object_state
+		)
+		SELECT
+			json_extract(value, '$.bucket'),
+			json_extract(value, '$.object_key'),
+			json_extract(value, '$.etag'),
+			CAST(json_extract(value, '$.size') AS INTEGER),
+			json_extract(value, '$.last_modified'),
+			json_extract(value, '$.blob_bucket'),
+			json_extract(value, '$.blob_key'),
+			json_extract(value, '$.blob_hash'),
+			CAST(json_extract(value, '$.blob_size') AS INTEGER),
+			json_extract(value, '$.hash_algo'),
+			json_extract(value, '$.last_seen_scan'),
+			json_extract(value, '$.object_state')
+		FROM json_each(?)
+	`, payload); err != nil {
+		return fmt.Errorf("apply discovery register batch: load staging table: %w", err)
+	}
+	return nil
+}
+
+func loadDiscoveryObjectIDBatch(ctx context.Context, tx *sql.Tx, payload []byte) error {
+	if _, err := tx.ExecContext(ctx, createDiscoveryObjectIDBatchTable); err != nil {
+		return fmt.Errorf("apply discovery object batch: create staging table: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM discovery_object_id_batch`); err != nil {
+		return fmt.Errorf("apply discovery object batch: clear staging table: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO discovery_object_id_batch (bucket, object_key, scan_id)
+		SELECT
+			json_extract(value, '$.bucket'),
+			json_extract(value, '$.object_key'),
+			json_extract(value, '$.scan_id')
+		FROM json_each(?)
+	`, payload); err != nil {
+		return fmt.Errorf("apply discovery object batch: load staging table: %w", err)
+	}
+	return nil
+}
+
+func marshalDiscoveryObjectIDs(objects []ObjectID) ([]byte, error) {
+	rows := make([]discoveryObjectIDRow, len(objects))
+	for index, object := range objects {
+		rows[index] = discoveryObjectIDRow{
+			Bucket:    object.Bucket,
+			ObjectKey: object.Key,
+			ScanID:    object.ScanID,
+		}
+	}
+	payload, err := json.Marshal(rows)
+	if err != nil {
+		return nil, fmt.Errorf("encode rows: %w", err)
+	}
+	return payload, nil
 }
 
 func (s *SQLiteStore) ApplyDedupBatch(ctx context.Context, objects []ObjectRecord) error {
