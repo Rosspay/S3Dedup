@@ -120,6 +120,83 @@ func BenchmarkDiscoveryBatchMutations(b *testing.B) {
 	})
 }
 
+func BenchmarkDiscoveryBatchMutationsLargeCache(b *testing.B) {
+	store := openBenchmarkStore(b)
+	ctx := context.Background()
+	const largeCacheObjects = 100000
+	populateBenchmarkStore(b, store, largeCacheObjects)
+
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		mutations := make([]DiscoveryMutation, 0, benchmarkDiscoveryObjects)
+		for index := 0; index < benchmarkDiscoveryObjects; index++ {
+			mutations = append(mutations, DiscoveryMutation{
+				Kind: DiscoveryMarkSeen,
+				ID: ObjectID{
+					Bucket: "bucket",
+					Key:    benchmarkRecord(0, index).Key,
+					ScanID: fmt.Sprintf("scan-%d", iteration),
+				},
+			})
+		}
+		if err := store.ApplyDiscoveryBatch(ctx, mutations); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ReportMetric(benchmarkDiscoveryObjects, "objects/op")
+	b.ReportMetric(largeCacheObjects, "cache-objects")
+}
+
+func BenchmarkDiscoveryMetadataUpdateLargeCache(b *testing.B) {
+	store := openBenchmarkStore(b)
+	ctx := context.Background()
+	const largeCacheObjects = 100000
+	populateBenchmarkStore(b, store, largeCacheObjects)
+
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		mutations := make([]DiscoveryMutation, 0, benchmarkDiscoveryObjects)
+		for index := 0; index < benchmarkDiscoveryObjects; index++ {
+			object := benchmarkRecord(0, index)
+			object.ETag = fmt.Sprintf("etag-%d-%d", iteration+1, index)
+			object.LastSeenScan = fmt.Sprintf("scan-%d", iteration+1)
+			mutations = append(mutations, DiscoveryMutation{
+				Kind:   DiscoveryRegister,
+				Object: object,
+			})
+		}
+		if err := store.ApplyDiscoveryBatch(ctx, mutations); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ReportMetric(benchmarkDiscoveryObjects, "objects/op")
+	b.ReportMetric(largeCacheObjects, "cache-objects")
+}
+
+func BenchmarkDiscoveryRegistrationLargeCache(b *testing.B) {
+	store := openBenchmarkStore(b)
+	ctx := context.Background()
+	const largeCacheObjects = 100000
+	populateBenchmarkStore(b, store, largeCacheObjects)
+
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		mutations := make([]DiscoveryMutation, 0, benchmarkDiscoveryObjects)
+		start := largeCacheObjects + iteration*benchmarkDiscoveryObjects
+		for index := start; index < start+benchmarkDiscoveryObjects; index++ {
+			mutations = append(mutations, DiscoveryMutation{
+				Kind:   DiscoveryRegister,
+				Object: benchmarkRecord(0, index),
+			})
+		}
+		if err := store.ApplyDiscoveryBatch(ctx, mutations); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ReportMetric(benchmarkDiscoveryObjects, "objects/op")
+	b.ReportMetric(largeCacheObjects, "initial-cache-objects")
+}
+
 func BenchmarkDiscoveryLookups(b *testing.B) {
 	store := openBenchmarkStore(b)
 	ctx := context.Background()
@@ -239,6 +316,27 @@ func registerBenchmarkObjects(
 	}
 	if err := store.ApplyDiscoveryBatch(ctx, mutations); err != nil {
 		b.Fatal(err)
+	}
+}
+
+func populateBenchmarkStore(b *testing.B, store *SQLiteStore, objectCount int) {
+	b.Helper()
+	ctx := context.Background()
+	for start := 0; start < objectCount; start += benchmarkDiscoveryObjects {
+		mutations := make([]DiscoveryMutation, 0, benchmarkDiscoveryObjects)
+		limit := start + benchmarkDiscoveryObjects
+		if limit > objectCount {
+			limit = objectCount
+		}
+		for index := start; index < limit; index++ {
+			mutations = append(mutations, DiscoveryMutation{
+				Kind:   DiscoveryRegister,
+				Object: benchmarkRecord(0, index),
+			})
+		}
+		if err := store.ApplyDiscoveryBatch(ctx, mutations); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

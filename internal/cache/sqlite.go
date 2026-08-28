@@ -83,6 +83,7 @@ func (s *SQLiteStore) initialize(ctx context.Context) error {
 		`PRAGMA foreign_keys = ON`,
 		`PRAGMA journal_mode = WAL`,
 		`PRAGMA busy_timeout = 5000`,
+		`PRAGMA temp_store = MEMORY`,
 		`CREATE TABLE IF NOT EXISTS blobs (
 			bucket TEXT NOT NULL,
 			blob_key TEXT NOT NULL,

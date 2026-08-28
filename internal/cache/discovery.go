@@ -36,6 +36,116 @@ const createDiscoveryObjectIDBatchTable = `
 	) WITHOUT ROWID
 `
 
+const upsertDiscoveryObjectsQuery = `
+	INSERT INTO objects (
+		bucket,
+		object_key,
+		etag,
+		size,
+		last_modified,
+		blob_bucket,
+		blob_hash,
+		hash_algo,
+		last_seen_scan,
+		object_state
+	)
+	SELECT
+		bucket,
+		object_key,
+		etag,
+		size,
+		last_modified,
+		blob_bucket,
+		blob_hash,
+		hash_algo,
+		last_seen_scan,
+		object_state
+	FROM discovery_register_batch
+	WHERE true
+	ON CONFLICT(bucket, object_key) DO UPDATE SET
+		etag = excluded.etag,
+		size = excluded.size,
+		last_modified = excluded.last_modified,
+		blob_bucket = excluded.blob_bucket,
+		blob_hash = excluded.blob_hash,
+		hash_algo = excluded.hash_algo,
+		last_seen_scan = excluded.last_seen_scan,
+		object_state = excluded.object_state
+`
+
+const markDiscoveryObjectsSeenQuery = `
+	INSERT INTO objects (
+		bucket,
+		object_key,
+		etag,
+		size,
+		last_modified,
+		blob_bucket,
+		blob_hash,
+		hash_algo,
+		last_seen_scan,
+		object_state
+	)
+	SELECT
+		o.bucket,
+		o.object_key,
+		o.etag,
+		o.size,
+		o.last_modified,
+		o.blob_bucket,
+		o.blob_hash,
+		o.hash_algo,
+		i.scan_id,
+		o.object_state
+	FROM discovery_object_id_batch AS i
+	CROSS JOIN objects AS o
+	ON o.bucket = i.bucket
+	AND o.object_key = i.object_key
+	WHERE true
+	ON CONFLICT(bucket, object_key) DO UPDATE SET
+		last_seen_scan = excluded.last_seen_scan
+`
+
+const decrementDiscoveryChangedBlobsQuery = `
+	WITH decrements AS (
+		SELECT
+			o.blob_bucket AS bucket,
+			o.blob_hash AS hash,
+			COUNT(*) AS ref_count
+		FROM discovery_register_batch AS r
+		CROSS JOIN objects AS o
+		ON o.bucket = r.bucket
+		AND o.object_key = r.object_key
+		WHERE o.blob_bucket <> r.blob_bucket
+		OR o.blob_hash <> r.blob_hash
+		GROUP BY o.blob_bucket, o.blob_hash
+	)
+	UPDATE blobs
+	SET ref_count = blobs.ref_count - d.ref_count
+	FROM decrements AS d
+	WHERE d.bucket = blobs.bucket
+	AND d.hash = blobs.hash
+`
+
+const decrementDiscoveryUnregisteredBlobsQuery = `
+	WITH decrements AS (
+		SELECT
+			o.blob_bucket AS bucket,
+			o.blob_hash AS hash,
+			COUNT(*) AS ref_count
+		FROM discovery_object_id_batch AS i
+		CROSS JOIN objects AS o
+		ON o.bucket = i.bucket
+		AND o.object_key = i.object_key
+		GROUP BY o.blob_bucket, o.blob_hash
+	)
+	UPDATE blobs
+	SET ref_count = blobs.ref_count - d.ref_count
+	FROM decrements AS d
+	WHERE d.bucket = blobs.bucket
+	AND d.hash = blobs.hash
+`
+
 type discoveryRegisterRow struct {
 	Bucket       string `json:"bucket"`
 	ObjectKey    string `json:"object_key"`
@@ -208,21 +318,7 @@ func applyDiscoveryRegisterBatch(
 		return fmt.Errorf("apply discovery register batch: count reference changes: %w", err)
 	}
 	if referenceChanges == 0 {
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE objects
-			SET
-				etag = i.etag,
-				size = i.size,
-				last_modified = i.last_modified,
-				blob_bucket = i.blob_bucket,
-				blob_hash = i.blob_hash,
-				hash_algo = i.hash_algo,
-				last_seen_scan = i.last_seen_scan,
-				object_state = i.object_state
-			FROM discovery_register_batch AS i
-			WHERE i.bucket = objects.bucket
-			AND i.object_key = objects.object_key
-		`); err != nil {
+		if err := upsertDiscoveryObjects(ctx, tx); err != nil {
 			return fmt.Errorf("apply discovery register batch: update object metadata: %w", err)
 		}
 		return nil
@@ -343,68 +439,19 @@ func applyDiscoveryRegisterBatch(
 		return fmt.Errorf("apply discovery register batch: increment blobs: %w", err)
 	}
 
-	if _, err := tx.ExecContext(ctx, `
-		WITH decrements AS (
-			SELECT
-				o.blob_bucket AS bucket,
-				o.blob_hash AS hash,
-				COUNT(*) AS ref_count
-			FROM discovery_register_batch AS r
-			JOIN objects AS o
-			ON o.bucket = r.bucket
-			AND o.object_key = r.object_key
-			WHERE o.blob_bucket <> r.blob_bucket
-			OR o.blob_hash <> r.blob_hash
-			GROUP BY o.blob_bucket, o.blob_hash
-		)
-		UPDATE blobs
-		SET ref_count = blobs.ref_count - d.ref_count
-		FROM decrements AS d
-		WHERE d.bucket = blobs.bucket
-		AND d.hash = blobs.hash
-	`); err != nil {
+	if _, err := tx.ExecContext(ctx, decrementDiscoveryChangedBlobsQuery); err != nil {
 		return fmt.Errorf("apply discovery register batch: decrement blobs: %w", err)
 	}
 
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO objects (
-			bucket,
-			object_key,
-			etag,
-			size,
-			last_modified,
-			blob_bucket,
-			blob_hash,
-			hash_algo,
-			last_seen_scan,
-			object_state
-		)
-		SELECT
-			bucket,
-			object_key,
-			etag,
-			size,
-			last_modified,
-			blob_bucket,
-			blob_hash,
-			hash_algo,
-			last_seen_scan,
-			object_state
-		FROM discovery_register_batch
-		WHERE true
-		ON CONFLICT(bucket, object_key) DO UPDATE SET
-			etag = excluded.etag,
-			size = excluded.size,
-			last_modified = excluded.last_modified,
-			blob_bucket = excluded.blob_bucket,
-			blob_hash = excluded.blob_hash,
-			hash_algo = excluded.hash_algo,
-			last_seen_scan = excluded.last_seen_scan,
-			object_state = excluded.object_state
-	`); err != nil {
+	if err := upsertDiscoveryObjects(ctx, tx); err != nil {
 		return fmt.Errorf("apply discovery register batch: upsert objects: %w", err)
 	}
 	return nil
+}
+
+func upsertDiscoveryObjects(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, upsertDiscoveryObjectsQuery)
+	return err
 }
 
 func applyDiscoveryMarkSeenBatch(
@@ -422,13 +469,7 @@ func applyDiscoveryMarkSeenBatch(
 	if err := loadDiscoveryObjectIDBatch(ctx, tx, payload); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE objects
-		SET last_seen_scan = i.scan_id
-		FROM discovery_object_id_batch AS i
-		WHERE i.bucket = objects.bucket
-		AND i.object_key = objects.object_key
-	`); err != nil {
+	if _, err := tx.ExecContext(ctx, markDiscoveryObjectsSeenQuery); err != nil {
 		return fmt.Errorf("apply discovery mark-seen batch: update objects: %w", err)
 	}
 	return nil
@@ -449,24 +490,7 @@ func applyDiscoveryUnregisterBatch(
 	if err := loadDiscoveryObjectIDBatch(ctx, tx, payload); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `
-		WITH decrements AS (
-			SELECT
-				o.blob_bucket AS bucket,
-				o.blob_hash AS hash,
-				COUNT(*) AS ref_count
-			FROM discovery_object_id_batch AS i
-			JOIN objects AS o
-			ON o.bucket = i.bucket
-			AND o.object_key = i.object_key
-			GROUP BY o.blob_bucket, o.blob_hash
-		)
-		UPDATE blobs
-		SET ref_count = blobs.ref_count - d.ref_count
-		FROM decrements AS d
-		WHERE d.bucket = blobs.bucket
-		AND d.hash = blobs.hash
-	`); err != nil {
+	if _, err := tx.ExecContext(ctx, decrementDiscoveryUnregisteredBlobsQuery); err != nil {
 		return fmt.Errorf("apply discovery unregister batch: decrement blobs: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `

@@ -11,8 +11,8 @@ s3:
   #  prefix: "my-prefix"
   #- name: "single-copy-bucket"
   #  prefix: "single_copy/"
-  #- name: "unique-bucket"
-  #  prefix: ""
+  - name: "unique-bucket"
+    prefix: ""
 dedup:
   hash_algo: "sha256"
   min_size_bytes: 0 #
@@ -25,7 +25,7 @@ cache:
   path: "state.db"
 schedule:
   scan_interval: "1h" #
-  workers: 64 #
+  workers: 16 #
 logging:
   level: "info"
   file: "service.log"

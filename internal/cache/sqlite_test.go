@@ -94,6 +94,17 @@ func TestOpenSQLiteErrors(t *testing.T) {
 	}
 }
 
+func TestOpenSQLiteUsesMemoryTempStore(t *testing.T) {
+	store := openTestStore(t)
+	var tempStore int
+	if err := store.db.QueryRow(`PRAGMA temp_store`).Scan(&tempStore); err != nil {
+		t.Fatalf("read temp_store: %v", err)
+	}
+	if tempStore != 2 {
+		t.Fatalf("temp_store = %d, expected MEMORY (2)", tempStore)
+	}
+}
+
 func TestGetObjectStatusesSupportsInMemoryDatabase(t *testing.T) {
 	store, err := OpenSQLite(":memory:")
 	if err != nil {

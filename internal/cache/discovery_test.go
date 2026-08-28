@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -392,6 +393,95 @@ func TestApplyDiscoveryBatchRollsBackOnSQLError(t *testing.T) {
 	if blobCount != 0 {
 		t.Fatalf("rolled-back blob count = %d, expected 0", blobCount)
 	}
+}
+
+func TestDiscoveryBatchQueriesUseStagingDrivenPlans(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	for _, statement := range []string{
+		createDiscoveryRegisterBatchTable,
+		createDiscoveryObjectIDBatchTable,
+	} {
+		if _, err := store.db.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("create staging table: %v", err)
+		}
+	}
+
+	tests := []struct {
+		name           string
+		query          string
+		expectedScan   string
+		expectedSearch string
+		forbiddenScan  string
+	}{
+		{
+			name:          "metadata upsert",
+			query:         upsertDiscoveryObjectsQuery,
+			expectedScan:  "SCAN discovery_register_batch",
+			forbiddenScan: "SCAN objects",
+		},
+		{
+			name:           "mark seen",
+			query:          markDiscoveryObjectsSeenQuery,
+			expectedScan:   "SCAN i",
+			expectedSearch: "SEARCH o USING INDEX sqlite_autoindex_objects_1",
+			forbiddenScan:  "SCAN objects",
+		},
+		{
+			name:           "changed blob decrement",
+			query:          decrementDiscoveryChangedBlobsQuery,
+			expectedScan:   "SCAN r",
+			expectedSearch: "SEARCH o USING INDEX sqlite_autoindex_objects_1",
+			forbiddenScan:  "SCAN o",
+		},
+		{
+			name:           "unregistered blob decrement",
+			query:          decrementDiscoveryUnregisteredBlobsQuery,
+			expectedScan:   "SCAN i",
+			expectedSearch: "SEARCH o USING INDEX sqlite_autoindex_objects_1",
+			forbiddenScan:  "SCAN o",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			plan := explainQueryPlan(t, store, test.query)
+			if strings.Contains(plan, test.forbiddenScan) {
+				t.Fatalf("query plan scans the full objects table:\n%s", plan)
+			}
+			if !strings.Contains(plan, test.expectedScan) {
+				t.Fatalf("query plan does not scan the staging batch:\n%s", plan)
+			}
+			if test.expectedSearch != "" && !strings.Contains(plan, test.expectedSearch) {
+				t.Fatalf("query plan does not use the objects primary key:\n%s", plan)
+			}
+		})
+	}
+}
+
+func explainQueryPlan(t *testing.T, store *SQLiteStore, query string) string {
+	t.Helper()
+	rows, err := store.db.QueryContext(context.Background(), "EXPLAIN QUERY PLAN "+query)
+	if err != nil {
+		t.Fatalf("explain query plan: %v", err)
+	}
+	defer rows.Close()
+
+	var details strings.Builder
+	for rows.Next() {
+		var id int
+		var parent int
+		var unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatalf("scan query plan: %v", err)
+		}
+		details.WriteString(detail)
+		details.WriteByte('\n')
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read query plan: %v", err)
+	}
+	return details.String()
 }
 
 func TestApplyDiscoveryBatchTreatsObjectKeysAsData(t *testing.T) {
